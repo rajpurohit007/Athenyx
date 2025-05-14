@@ -1,0 +1,31 @@
+
+* {
+    margin: 0;
+    padding: 0;
+}
+nav {
+    padding: 2vh 10vh;
+    display: flex;
+    background: rgba(255,255,255,0.2);
+    backdrop-filter: blur(100px);
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+}
+nav ul {
+    display: flex;
+    gap: 4vh;
+    list-style-type: none;
+
+}
+nav li a {
+    text-decoration: none;
+    color: #1d3557;
+}
+nav li:hover {
+    transform: translateY(-5px);
+    transition: 0.3s ease-in-out;
+}
+.Company_Name {
+    font-size: larger;
+    font-weight: 700;
+    color: #1d3557;
+}
