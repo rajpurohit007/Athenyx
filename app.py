@@ -8,7 +8,11 @@ import time
 import os
 import json
 from pymongo import MongoClient
-from pymongo.errors import ConnectionError, PyMongoError
+# CORRECTED: Import only PyMongoError, as ConnectionError is removed in recent PyMongo versions
+from pymongo.errors import PyMongoError, ServerSelectionTimeoutError 
+# Using standard Python's TimeoutError for connection issues
+from socket import timeout as TimeoutError 
+
 
 # --- Configuration: Reads from Environment Variables ---
 try:
@@ -23,9 +27,9 @@ try:
     
     # NEW: MongoDB Configuration - MUST BE SET IN RENDER
     MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb+srv://rajpurohit74747:Raj12345@padhaion.qxq1zfs.mongodb.net/?")
+
 except Exception as e:
     print(f"FATAL ERROR: Failed to load environment variables. {e}")
-    # Consider raising an error or exiting here if config is essential
     
 
 app = Flask(__name__)
@@ -34,14 +38,15 @@ app = Flask(__name__)
 waitlist_collection = None
 try:
     client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+    # Ping the server to check connection
     client.admin.command('ping')
     print("Successfully connected to MongoDB.")
     db = client.get_default_database()
     waitlist_collection = db['waitlist_entries']
-    # Create a unique index for fast lookups and preventing duplicate entries
     waitlist_collection.create_index([("email", 1), ("variant_id", 1)], unique=True)
-except (ConnectionError, PyMongoError) as e:
-    print(f"ERROR: Could not connect to MongoDB: {e}")
+# CORRECTED ERROR HANDLING: Catch specific PyMongo errors and standard TimeoutError
+except (ServerSelectionTimeoutError, PyMongoError, TimeoutError) as e:
+    print(f"ERROR: Could not connect to MongoDB. Please check MONGODB_URI and firewall. Error: {e}")
 
 # Configure CORS
 if STOREFRONT_BASE_URL:
@@ -54,7 +59,12 @@ else:
 def is_subscribed(email, variant_id):
     """Checks if a customer is already subscribed for a specific variant."""
     if not waitlist_collection: return False
-    return waitlist_collection.find_one({'email': email, 'variant_id': str(variant_id)}) is not None
+    try:
+        return waitlist_collection.find_one({'email': email, 'variant_id': str(variant_id)}) is not None
+    except PyMongoError as e:
+        print(f"DB Error checking subscription: {e}")
+        return False
+
 
 def add_waitlist_entry(email, variant_id):
     """Adds or updates a waitlist entry, ensuring uniqueness."""
@@ -62,7 +72,6 @@ def add_waitlist_entry(email, variant_id):
         print("DB Not Connected.")
         return False
     try:
-        # Use str(variant_id) to ensure consistent type matching MongoDB
         waitlist_collection.update_one(
             {'email': email, 'variant_id': str(variant_id)},
             {'$set': {'timestamp': time.time()}},
@@ -73,23 +82,27 @@ def add_waitlist_entry(email, variant_id):
         print(f"DB Error adding entry: {e}")
         return False
 
-# ... (get_waitlist_entries, remove_waitlist_entry, check_shopify_stock, send_email functions remain as in the previous fully updated code) ...
 def get_waitlist_entries():
     """Retrieves all unique variant IDs and the emails waiting for them."""
     if not waitlist_collection:
         return {}
     
-    pipeline = [
-        {
-            '$group': {
-                '_id': '$variant_id',
-                'emails': {'$addToSet': '$email'}
+    try:
+        pipeline = [
+            {
+                '$group': {
+                    '_id': '$variant_id',
+                    'emails': {'$addToSet': '$email'}
+                }
             }
-        }
-    ]
-    results = list(waitlist_collection.aggregate(pipeline))
-    waitlist_map = {item['_id']: item['emails'] for item in results}
-    return waitlist_map
+        ]
+        results = list(waitlist_collection.aggregate(pipeline))
+        waitlist_map = {item['_id']: item['emails'] for item in results}
+        return waitlist_map
+    except PyMongoError as e:
+        print(f"DB Error fetching waitlist: {e}")
+        return {}
+
 
 def remove_waitlist_entry(email, variant_id):
     """Removes a customer from a specific product's waitlist."""
@@ -101,6 +114,7 @@ def remove_waitlist_entry(email, variant_id):
         print(f"DB Error removing entry: {e}")
         return False
 
+# --- Shopify API Helper (Unchanged) ---
 def check_shopify_stock(variant_id):
     """Fetches the inventory quantity for a specific product variant."""
     if not SHOPIFY_STORE_URL or not SHOPIFY_API_KEY: return False
@@ -124,6 +138,7 @@ def check_shopify_stock(variant_id):
         print(f"Shopify API Error checking variant {variant_id}. Error: {e}")
         return False
 
+# --- Email Helper (Unchanged) ---
 def send_email(to_email, subject, body):
     """Sends an email using the configured SMTP settings."""
     if not all([SMTP_SERVER, EMAIL_ADDRESS, EMAIL_PASSWORD]):
@@ -204,7 +219,7 @@ def notify_signup():
         return jsonify({"error": "Internal server error during processing."}), 500
 
 
-# --- Background Stock Checker (Unchanged, but now using DB) ---
+# --- Background Stock Checker ---
 def stock_checker_task():
     """Background task to periodically check stock and send notifications."""
     print("Stock checker thread started.")
