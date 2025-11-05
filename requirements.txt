@@ -1,0 +1,3 @@
+Flask
+requests
+gunicorn # Recommended for production deployment on Render
