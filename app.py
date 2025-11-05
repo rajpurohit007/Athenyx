@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from flask_cors import CORS # NEW: Import CORS
+from flask_cors import CORS
 import requests
 import smtplib
 from email.mime.text import MIMEText
@@ -7,54 +7,111 @@ from threading import Thread
 import time
 import os
 import json
+from pymongo import MongoClient
+from pymongo.errors import ConnectionError, PyMongoError
 
-# --- Configuration: Reads from Environment Variables (CORRECTED) ---
+# --- Configuration: Reads from Environment Variables ---
 try:
-    # ⚠️ IMPORTANT: These must be the names of the variables set on Render
     SHOPIFY_STORE_URL = os.environ.get("SHOPIFY_STORE_URL", "raj-dynamic-dreamz.myshopify.com") 
-    SHOPIFY_API_KEY = os.environ.get("SHOPIFY_API_KEY", "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")  # Private App Access Token
+    SHOPIFY_API_KEY = os.environ.get("SHOPIFY_API_KEY", "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")
     SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
     SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
     EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS", "rajpurohit74747@gmail.com")
-    EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "vvhj rkau nncu ugdj")  # App Password for email
+    EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "vvhj rkau nncu ugdj")
     SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2023-10") 
-    # Storefront URL for notification links (e.g., "https://raj-dynamic-dreamz.myshopify.com")
     STOREFRONT_BASE_URL = os.environ.get("STOREFRONT_BASE_URL", f"https://{SHOPIFY_STORE_URL}")
+    
+    # NEW: MongoDB Configuration
+    MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017/shopify_waitlist")
+
 except Exception as e:
-    print(f"FATAL ERROR: Failed to load environment variables. Please check configuration. {e}")
+    print(f"FATAL ERROR: Failed to load environment variables. {e}")
+    # Exit or fail gracefully if required environment variables are missing
+    
 
 app = Flask(__name__)
 
-# --- CRITICAL FIX: Configure CORS to allow cross-origin requests from your Shopify store ---
-# This line tells the browser that requests from your Shopify domain are safe.
+# Initialize MongoDB Client
+try:
+    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+    # Ping the server to check connection
+    client.admin.command('ping')
+    print("Successfully connected to MongoDB.")
+    db = client.get_default_database() # Uses database defined in the MONGODB_URI
+    waitlist_collection = db['waitlist_entries']
+    waitlist_collection.create_index([("email", 1), ("variant_id", 1)], unique=True)
+except (ConnectionError, PyMongoError) as e:
+    print(f"ERROR: Could not connect to MongoDB: {e}")
+    waitlist_collection = None # Ensure collection is None if connection fails
+
+# Configure CORS
 if STOREFRONT_BASE_URL:
-    # Allow only the specific store domain (safer)
     CORS(app, resources={r"/*": {"origins": STOREFRONT_BASE_URL}})
 else:
-    # Default to allowing all origins if base URL is not set (less secure, but avoids errors)
     CORS(app) 
 
-# Simple in-memory storage for demonstration (USE A DATABASE FOR PRODUCTION)
-# Format: {email: product_variant_id, ...}
-waitlist = {}
+# --- Database Helpers ---
 
-# --- Shopify API Helper ---
+def add_waitlist_entry(email, variant_id):
+    """Adds or updates a waitlist entry, ensuring uniqueness."""
+    if not waitlist_collection:
+        print("DB Not Connected.")
+        return False
+    try:
+        waitlist_collection.update_one(
+            {'email': email, 'variant_id': variant_id},
+            {'$set': {'timestamp': time.time()}},
+            upsert=True
+        )
+        return True
+    except PyMongoError as e:
+        print(f"DB Error adding entry: {e}")
+        return False
+
+def get_waitlist_entries():
+    """Retrieves all unique variant IDs and the emails waiting for them."""
+    if not waitlist_collection:
+        return {}
+    
+    # Group by variant_id and collect all emails for that variant
+    pipeline = [
+        {
+            '$group': {
+                '_id': '$variant_id',
+                'emails': {'$addToSet': '$email'}
+            }
+        }
+    ]
+    
+    results = list(waitlist_collection.aggregate(pipeline))
+    
+    # Format: {variant_id: [email1, email2, ...]}
+    waitlist_map = {item['_id']: item['emails'] for item in results}
+    return waitlist_map
+
+def remove_waitlist_entry(email, variant_id):
+    """Removes a customer from a specific product's waitlist."""
+    if not waitlist_collection:
+        return False
+    try:
+        waitlist_collection.delete_one({'email': email, 'variant_id': variant_id})
+        return True
+    except PyMongoError as e:
+        print(f"DB Error removing entry: {e}")
+        return False
+
+# --- Shopify API Helper (Unchanged) ---
 def check_shopify_stock(variant_id):
     """Fetches the inventory quantity for a specific product variant."""
     if not SHOPIFY_STORE_URL or not SHOPIFY_API_KEY:
         print("Configuration missing: Shopify URL or API Key is empty.")
         return False
         
-    # Shopify variant IDs can be very long (e.g., 81234567890). Assuming it's the raw ID here.
     numeric_id = str(variant_id).split('/')[-1]
-
-    # Construct clean URL
     url = (
         f"https://{SHOPIFY_STORE_URL}/admin/api/{SHOPIFY_API_VERSION}"
         f"/variants/{numeric_id}.json"
     )
-
-    # Use the correct authentication header
     headers = {
         "Content-Type": "application/json",
         "X-Shopify-Access-Token": SHOPIFY_API_KEY
@@ -68,10 +125,10 @@ def check_shopify_stock(variant_id):
         print(f"Stock check for variant {variant_id}: {inventory_quantity} available.")
         return inventory_quantity > 0
     except requests.exceptions.RequestException as e:
-        print(f"Shopify API Error checking variant {variant_id}. Response status: {response.status_code if 'response' in locals() else 'N/A'}. Error: {e}")
+        print(f"Shopify API Error checking variant {variant_id}. Error: {e}")
         return False
 
-# --- Email Helper ---
+# --- Email Helper (Unchanged) ---
 def send_email(to_email, subject, body):
     """Sends an email using the configured SMTP settings."""
     if not all([SMTP_SERVER, EMAIL_ADDRESS, EMAIL_PASSWORD]):
@@ -99,14 +156,12 @@ def send_email(to_email, subject, body):
 @app.route('/', methods=['GET'])
 def home():
     """Simple check for Render health check."""
-    # This also resolves the 404 errors seen in your logs for GET /
     return "Shopify Waitlist Service is running.", 200
 
 @app.route('/notify-signup', methods=['POST'])
 def notify_signup():
     """Handles the user sign-up request from the Shopify Liquid template."""
     try:
-        # Check Content-Type for Flask's request.get_json()
         if request.content_type != 'application/json':
              return jsonify({"error": "Content-Type must be application/json."}), 415
 
@@ -117,19 +172,19 @@ def notify_signup():
         if not email or not variant_id:
             return jsonify({"error": "Missing email or product variant ID."}), 400
 
-        # Add user to the waitlist (overwrite existing if they re-subscribe)
-        waitlist[email] = variant_id
-        
-        # 1. Send initial confirmation email
-        initial_subject = "✅ You're on the Waitlist!"
-        initial_body = (
-            f"Thanks! We've added your email, {email}, to the notification list. "
-            "We will send you a second email the moment the product is back in stock."
-        )
-        send_email(email, initial_subject, initial_body)
+        # Add user to the MongoDB waitlist
+        if add_waitlist_entry(email, variant_id):
+            # Send initial confirmation email
+            initial_subject = "✅ You're on the Waitlist!"
+            initial_body = (
+                f"Thanks! We've added your email, {email}, to the notification list for product variant {variant_id}. "
+                "We will send you a second email the moment the item is back in stock."
+            )
+            send_email(email, initial_subject, initial_body)
 
-        # IMPORTANT: Return success message immediately to the Shopify storefront
-        return jsonify({"message": "Successfully added to the waitlist. Confirmation email sent."}), 200
+            return jsonify({"message": "Successfully added to the waitlist. Confirmation email sent."}), 200
+        else:
+             return jsonify({"error": "Failed to save entry to database."}), 500
         
     except Exception as e:
         print(f"Error processing sign-up request: {e}")
@@ -140,54 +195,46 @@ def notify_signup():
 
 def stock_checker_task():
     """Background task to periodically check stock and send notifications."""
-    global waitlist
     print("Stock checker thread started.")
-    time.sleep(60) # Wait 1 minute before first check
+    time.sleep(60)
     
     while True:
-        print(f"Starting stock check cycle. Waitlist size: {len(waitlist)}")
-        time.sleep(900) # Check stock every 15 minutes
+        waitlist_map = get_waitlist_entries()
+        print(f"Starting stock check cycle. Checking {len(waitlist_map)} unique variants.")
         
-        # Use a copy of keys for safe iteration while modifying the waitlist
-        emails_to_check = list(waitlist.keys())
-        notified_emails = [] 
-        
-        for email in emails_to_check:
-            variant_id = waitlist.get(email)
-            if variant_id is None:
-                continue
+        notified_list = [] # List of (email, variant_id) tuples to remove
 
+        for variant_id, emails in waitlist_map.items():
             if check_shopify_stock(variant_id):
                 # Product is IN STOCK!
+                print(f"Variant {variant_id} is IN STOCK. Notifying {len(emails)} customers.")
                 
-                # 2. Send in-stock notification email
                 notification_subject = "🎉 IN STOCK NOW! Buy Before It Sells Out!"
-                notification_body = (
-                    f"Great news, {email}! The product you were waiting for "
-                    "is officially back in stock! \n\n"
-                    "Don't wait, buy it here: "
-                    # Construct a generic link using the variant ID. You should ideally use a product handle here.
-                    f"{STOREFRONT_BASE_URL}/cart/{variant_id}:1" 
-                    "\n\nNote: This link adds one item directly to your cart."
-                )
                 
-                if send_email(email, notification_subject, notification_body):
-                    notified_emails.append(email)
+                for email in emails:
+                    notification_body = (
+                        f"Great news, {email}! The product you were waiting for "
+                        f"is officially back in stock! Variant ID: {variant_id}.\n\n"
+                        "Don't wait, buy it here: "
+                        f"{STOREFRONT_BASE_URL}/cart/{variant_id}:1" 
+                        "\n\nNote: This link adds one item directly to your cart."
+                    )
+                    
+                    if send_email(email, notification_subject, notification_body):
+                        notified_list.append((email, variant_id))
 
-        # Safely remove notified customers
-        for email in notified_emails:
-            if email in waitlist:
-                del waitlist[email]
+        # Safely remove notified customers from the database
+        for email, variant_id in notified_list:
+            remove_waitlist_entry(email, variant_id)
         
-        print(f"Stock check cycle complete. {len(notified_emails)} notifications sent.")
+        print(f"Stock check cycle complete. {len(notified_list)} notifications sent and removed from DB.")
+        time.sleep(900) # Check stock every 15 minutes
 
 
 # --- Run Application ---
 if __name__ == '__main__':
-    # Start the background thread for stock checking
     stock_thread = Thread(target=stock_checker_task)
     stock_thread.daemon = True 
     stock_thread.start()
     
-    # Render uses the PORT environment variable, defaults to 8080
     app.run(host='0.0.0.0', port=os.environ.get('PORT', 8080))
