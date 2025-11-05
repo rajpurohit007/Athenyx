@@ -17,32 +17,32 @@ try:
     SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
     SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
     EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS", "rajpurohit74747@gmail.com")
-    EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "vvhj rkau nncu ugdj")
+    EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "vvhj rkau nncu ugdj") # App Password
     SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2023-10") 
     STOREFRONT_BASE_URL = os.environ.get("STOREFRONT_BASE_URL", f"https://{SHOPIFY_STORE_URL}")
     
-    # NEW: MongoDB Configuration
-    MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017/shopify_waitlist")
+    # NEW: MongoDB Configuration - MUST BE SET IN RENDER
+    MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017/shopify_waitlist_db")
 
 except Exception as e:
     print(f"FATAL ERROR: Failed to load environment variables. {e}")
-    # Exit or fail gracefully if required environment variables are missing
+    # Consider raising an error or exiting here if config is essential
     
 
 app = Flask(__name__)
 
 # Initialize MongoDB Client
+waitlist_collection = None
 try:
     client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    # Ping the server to check connection
     client.admin.command('ping')
     print("Successfully connected to MongoDB.")
-    db = client.get_default_database() # Uses database defined in the MONGODB_URI
+    db = client.get_default_database()
     waitlist_collection = db['waitlist_entries']
+    # Create a unique index for fast lookups and preventing duplicate entries
     waitlist_collection.create_index([("email", 1), ("variant_id", 1)], unique=True)
 except (ConnectionError, PyMongoError) as e:
     print(f"ERROR: Could not connect to MongoDB: {e}")
-    waitlist_collection = None # Ensure collection is None if connection fails
 
 # Configure CORS
 if STOREFRONT_BASE_URL:
@@ -52,14 +52,20 @@ else:
 
 # --- Database Helpers ---
 
+def is_subscribed(email, variant_id):
+    """Checks if a customer is already subscribed for a specific variant."""
+    if not waitlist_collection: return False
+    return waitlist_collection.find_one({'email': email, 'variant_id': str(variant_id)}) is not None
+
 def add_waitlist_entry(email, variant_id):
     """Adds or updates a waitlist entry, ensuring uniqueness."""
     if not waitlist_collection:
         print("DB Not Connected.")
         return False
     try:
+        # Use str(variant_id) to ensure consistent type matching MongoDB
         waitlist_collection.update_one(
-            {'email': email, 'variant_id': variant_id},
+            {'email': email, 'variant_id': str(variant_id)},
             {'$set': {'timestamp': time.time()}},
             upsert=True
         )
@@ -68,12 +74,12 @@ def add_waitlist_entry(email, variant_id):
         print(f"DB Error adding entry: {e}")
         return False
 
+# ... (get_waitlist_entries, remove_waitlist_entry, check_shopify_stock, send_email functions remain as in the previous fully updated code) ...
 def get_waitlist_entries():
     """Retrieves all unique variant IDs and the emails waiting for them."""
     if not waitlist_collection:
         return {}
     
-    # Group by variant_id and collect all emails for that variant
     pipeline = [
         {
             '$group': {
@@ -82,31 +88,23 @@ def get_waitlist_entries():
             }
         }
     ]
-    
     results = list(waitlist_collection.aggregate(pipeline))
-    
-    # Format: {variant_id: [email1, email2, ...]}
     waitlist_map = {item['_id']: item['emails'] for item in results}
     return waitlist_map
 
 def remove_waitlist_entry(email, variant_id):
     """Removes a customer from a specific product's waitlist."""
-    if not waitlist_collection:
-        return False
+    if not waitlist_collection: return False
     try:
-        waitlist_collection.delete_one({'email': email, 'variant_id': variant_id})
+        waitlist_collection.delete_one({'email': email, 'variant_id': str(variant_id)})
         return True
     except PyMongoError as e:
         print(f"DB Error removing entry: {e}")
         return False
 
-# --- Shopify API Helper (Unchanged) ---
 def check_shopify_stock(variant_id):
     """Fetches the inventory quantity for a specific product variant."""
-    if not SHOPIFY_STORE_URL or not SHOPIFY_API_KEY:
-        print("Configuration missing: Shopify URL or API Key is empty.")
-        return False
-        
+    if not SHOPIFY_STORE_URL or not SHOPIFY_API_KEY: return False
     numeric_id = str(variant_id).split('/')[-1]
     url = (
         f"https://{SHOPIFY_STORE_URL}/admin/api/{SHOPIFY_API_VERSION}"
@@ -116,7 +114,6 @@ def check_shopify_stock(variant_id):
         "Content-Type": "application/json",
         "X-Shopify-Access-Token": SHOPIFY_API_KEY
     }
-
     try:
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
@@ -128,7 +125,6 @@ def check_shopify_stock(variant_id):
         print(f"Shopify API Error checking variant {variant_id}. Error: {e}")
         return False
 
-# --- Email Helper (Unchanged) ---
 def send_email(to_email, subject, body):
     """Sends an email using the configured SMTP settings."""
     if not all([SMTP_SERVER, EMAIL_ADDRESS, EMAIL_PASSWORD]):
@@ -150,13 +146,27 @@ def send_email(to_email, subject, body):
     except Exception as e:
         print(f"Email sending failed to {to_email}: {e}")
         return False
-
 # --- Endpoints ---
 
 @app.route('/', methods=['GET'])
 def home():
     """Simple check for Render health check."""
     return "Shopify Waitlist Service is running.", 200
+
+@app.route('/check-subscription', methods=['GET'])
+def check_subscription():
+    """NEW ENDPOINT: Checks subscription status for a logged-in user."""
+    email = request.args.get('email')
+    variant_id = request.args.get('variant_id')
+
+    if not email or not variant_id:
+        return jsonify({"error": "Missing email or variant ID."}), 400
+
+    if is_subscribed(email, variant_id):
+        return jsonify({"subscribed": True}), 200
+    else:
+        return jsonify({"subscribed": False}), 200
+
 
 @app.route('/notify-signup', methods=['POST'])
 def notify_signup():
@@ -171,6 +181,10 @@ def notify_signup():
 
         if not email or not variant_id:
             return jsonify({"error": "Missing email or product variant ID."}), 400
+
+        # Check if already subscribed to prevent redundant processing/emails
+        if is_subscribed(email, variant_id):
+            return jsonify({"message": "You are already subscribed to the waitlist for this product."}), 200
 
         # Add user to the MongoDB waitlist
         if add_waitlist_entry(email, variant_id):
@@ -191,8 +205,7 @@ def notify_signup():
         return jsonify({"error": "Internal server error during processing."}), 500
 
 
-# --- Background Stock Checker ---
-
+# --- Background Stock Checker (Unchanged, but now using DB) ---
 def stock_checker_task():
     """Background task to periodically check stock and send notifications."""
     print("Stock checker thread started.")
@@ -202,11 +215,10 @@ def stock_checker_task():
         waitlist_map = get_waitlist_entries()
         print(f"Starting stock check cycle. Checking {len(waitlist_map)} unique variants.")
         
-        notified_list = [] # List of (email, variant_id) tuples to remove
+        notified_list = []
 
         for variant_id, emails in waitlist_map.items():
             if check_shopify_stock(variant_id):
-                # Product is IN STOCK!
                 print(f"Variant {variant_id} is IN STOCK. Notifying {len(emails)} customers.")
                 
                 notification_subject = "🎉 IN STOCK NOW! Buy Before It Sells Out!"
@@ -233,8 +245,11 @@ def stock_checker_task():
 
 # --- Run Application ---
 if __name__ == '__main__':
-    stock_thread = Thread(target=stock_checker_task)
-    stock_thread.daemon = True 
-    stock_thread.start()
+    if waitlist_collection is not None:
+        stock_thread = Thread(target=stock_checker_task)
+        stock_thread.daemon = True 
+        stock_thread.start()
+    else:
+        print("WARNING: Stock checker not started due to MongoDB connection failure.")
     
     app.run(host='0.0.0.0', port=os.environ.get('PORT', 8080))
