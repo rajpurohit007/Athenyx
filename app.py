@@ -18,7 +18,7 @@ try:
     SHOPIFY_STORE_URL = os.environ.get("SHOPIFY_STORE_URL", "raj-dynamic-dreamz.myshopify.com") 
     
     # !!! WARNING: Removed the hardcoded key here. Ensure this is set in Render ENV vars!
-    SHOPIFY_API_KEY = os.environ.get("SHOPIFY_API_KEY") 
+    SHOPIFY_API_KEY = os.environ.get("5d9f422c303e02187b2442b1b68edf6a") 
     
     SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
     SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
