@@ -22,8 +22,7 @@ try:
     STOREFRONT_BASE_URL = os.environ.get("STOREFRONT_BASE_URL", f"https://{SHOPIFY_STORE_URL}")
     
     # NEW: MongoDB Configuration - MUST BE SET IN RENDER
-    MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017/shopify_waitlist_db")
-
+    MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb+srv://rajpurohit74747:Raj12345@padhaion.qxq1zfs.mongodb.net/?")
 except Exception as e:
     print(f"FATAL ERROR: Failed to load environment variables. {e}")
     # Consider raising an error or exiting here if config is essential
