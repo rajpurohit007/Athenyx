@@ -25,7 +25,7 @@ try:
     SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2023-10") 
     STOREFRONT_BASE_URL = os.environ.get("STOREFRONT_BASE_URL", f"https://{SHOPIFY_STORE_URL}")
     
-    # NEW: MongoDB Configuration - MUST BE SET IN RENDER
+    # NEW: MongoDB Configuration - Use the URI that worked for connection
     MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb+srv://rajpurohit74747:raj123@padhaion.qxq1zfs.mongodb.net/?appName=PadhaiOn")
 
 except Exception as e:
@@ -40,13 +40,17 @@ try:
     client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
     # Ping the server to check connection
     client.admin.command('ping')
-    print("Successfully connected to MongoDB.")
-    db = client.get_default_database()
+    
+    # FIX: Explicitly specify the database name instead of using get_default_database()
+    db = client['shopify_waitlist_db'] 
+    
     waitlist_collection = db['waitlist_entries']
     waitlist_collection.create_index([("email", 1), ("variant_id", 1)], unique=True)
-# CORRECTED ERROR HANDLING: Catch specific PyMongo errors and standard TimeoutError
+    
+    print("Successfully connected to MongoDB and initialized database.")
+    
 except (ServerSelectionTimeoutError, PyMongoError, TimeoutError) as e:
-    print(f"ERROR: Could not connect to MongoDB. Please check MONGODB_URI and firewall. Error: {e}")
+    print(f"ERROR: Could not connect to MongoDB. Please check MONGODB_URI/password/DB name. Error: {e}")
 
 # Configure CORS
 if STOREFRONT_BASE_URL:
@@ -55,7 +59,8 @@ else:
     CORS(app) 
 
 # --- Database Helpers ---
-
+# (Rest of the code remains the same as previously provided)
+# ...
 def is_subscribed(email, variant_id):
     """Checks if a customer is already subscribed for a specific variant."""
     if not waitlist_collection: return False
