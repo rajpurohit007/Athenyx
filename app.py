@@ -8,9 +8,7 @@ import time
 import os
 import json
 from pymongo import MongoClient
-# CORRECTED: Import only PyMongoError, as ConnectionError is removed in recent PyMongo versions
 from pymongo.errors import PyMongoError, ServerSelectionTimeoutError 
-# Using standard Python's TimeoutError for connection issues
 from socket import timeout as TimeoutError 
 
 
@@ -25,7 +23,7 @@ try:
     SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2023-10") 
     STOREFRONT_BASE_URL = os.environ.get("STOREFRONT_BASE_URL", f"https://{SHOPIFY_STORE_URL}")
     
-    # NEW: MongoDB Configuration - Use the URI that worked for connection
+    # NEW: MongoDB Configuration 
     MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb+srv://rajpurohit74747:raj123@padhaion.qxq1zfs.mongodb.net/?appName=PadhaiOn")
 
 except Exception as e:
@@ -41,7 +39,7 @@ try:
     # Ping the server to check connection
     client.admin.command('ping')
     
-    # FIX: Explicitly specify the database name instead of using get_default_database()
+    # FIX: Explicitly specify the database name
     db = client['shopify_waitlist_db'] 
     
     waitlist_collection = db['waitlist_entries']
@@ -59,11 +57,10 @@ else:
     CORS(app) 
 
 # --- Database Helpers ---
-# (Rest of the code remains the same as previously provided)
-# ...
+
 def is_subscribed(email, variant_id):
     """Checks if a customer is already subscribed for a specific variant."""
-    if not waitlist_collection: return False
+    if waitlist_collection is None: return False # FIXED: Use 'is None'
     try:
         return waitlist_collection.find_one({'email': email, 'variant_id': str(variant_id)}) is not None
     except PyMongoError as e:
@@ -73,7 +70,7 @@ def is_subscribed(email, variant_id):
 
 def add_waitlist_entry(email, variant_id):
     """Adds or updates a waitlist entry, ensuring uniqueness."""
-    if not waitlist_collection:
+    if waitlist_collection is None: # FIXED: Use 'is None'
         print("DB Not Connected.")
         return False
     try:
@@ -89,7 +86,7 @@ def add_waitlist_entry(email, variant_id):
 
 def get_waitlist_entries():
     """Retrieves all unique variant IDs and the emails waiting for them."""
-    if not waitlist_collection:
+    if waitlist_collection is None: # FIXED: Use 'is None'
         return {}
     
     try:
@@ -111,7 +108,7 @@ def get_waitlist_entries():
 
 def remove_waitlist_entry(email, variant_id):
     """Removes a customer from a specific product's waitlist."""
-    if not waitlist_collection: return False
+    if waitlist_collection is None: return False # FIXED: Use 'is None'
     try:
         waitlist_collection.delete_one({'email': email, 'variant_id': str(variant_id)})
         return True
