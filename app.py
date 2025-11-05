@@ -3,14 +3,14 @@ from flask_cors import CORS
 import requests
 import smtplib
 from email.mime.text import MIMEText
-import threading # Use 'threading' module for enumerate
+import threading 
 import time
 import os
 import json
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError, ServerSelectionTimeoutError 
 from socket import timeout as TimeoutError 
-import re # Import regex for robust ID extraction
+import re 
 
 # --- Configuration: Reads from Environment Variables ---
 try:
@@ -61,7 +61,7 @@ if STOREFRONT_BASE_URL:
 else:
     CORS(app) 
 
-# --- Database Helpers ---
+# --- Database Helpers (No Change) ---
 
 def is_subscribed(email, variant_id):
     """Checks if a customer is already subscribed for a specific variant."""
@@ -121,7 +121,7 @@ def remove_waitlist_entry(email, variant_id):
         print(f"DB Error removing entry: {e}")
         return False
 
-# --- Shopify API Helper ---
+# --- Shopify API Helper (No Change) ---
 def check_shopify_stock(variant_id):
     """Fetches the inventory quantity for a specific product variant."""
     if not SHOPIFY_STORE_URL or not SHOPIFY_API_KEY: 
@@ -155,6 +155,7 @@ def check_shopify_stock(variant_id):
         data = response.json()
         inventory_quantity = data['variant']['inventory_quantity']
         print(f"Stock check for variant {variant_id} (ID: {numeric_id}): {inventory_quantity} available.")
+        # This is the core logic: check if quantity is greater than zero
         return inventory_quantity > 0
     except requests.exceptions.HTTPError as http_err:
         print(f"Shopify API HTTP Error (status {response.status_code}) checking variant {variant_id}. Check API key permissions! Error: {http_err}")
@@ -163,7 +164,7 @@ def check_shopify_stock(variant_id):
         print(f"Shopify API Request Error checking variant {variant_id}. Error: {e}")
         return False
 
-# --- Email Helper ---
+# --- Email Helper (No Change) ---
 def send_email(to_email, subject, body):
     """Sends an email using the configured SMTP settings."""
     if not all([SMTP_SERVER, EMAIL_ADDRESS, EMAIL_PASSWORD]):
@@ -186,7 +187,7 @@ def send_email(to_email, subject, body):
         print(f"Email sending failed to {to_email}: {e}")
         return False
 
-# --- Endpoints (Unchanged) ---
+# --- Endpoints (No Change) ---
 
 @app.route('/', methods=['GET'])
 def home():
@@ -245,11 +246,16 @@ def notify_signup():
         return jsonify({"error": "Internal server error during processing."}), 500
 
 
-# --- Background Stock Checker ---
+# --- Background Stock Checker (UPDATED INTERVAL) ---
 def stock_checker_task():
     """Background task to periodically check stock and send notifications."""
     print("Stock checker thread started.")
-    time.sleep(60) 
+    
+    # Wait only a short time before the first check
+    time.sleep(5) 
+    
+    # Check interval set to 5 minutes (300 seconds)
+    CHECK_INTERVAL_SECONDS = 300 
     
     while True:
         start_time = time.time()
@@ -263,12 +269,14 @@ def stock_checker_task():
         for variant_id, emails in waitlist_map.items():
             print(f"Checking stock for variant {variant_id} (Emails: {len(emails)})")
             
+            # Check the Shopify API
             if check_shopify_stock(variant_id):
                 print(f"Variant {variant_id} is IN STOCK. Notifying {len(emails)} customers.")
                 
                 notification_subject = "🎉 IN STOCK NOW! Buy Before It Sells Out!"
                 
                 for email in emails:
+                    # Construct the direct 'add to cart' link
                     notification_body = (
                         f"Great news, {email}! The product you were waiting for "
                         f"is officially back in stock! Variant ID: {variant_id}.\n\n"
@@ -294,20 +302,20 @@ def stock_checker_task():
         duration = end_time - start_time
         print(f"--- Stock check cycle complete. {len(notified_list)} notifications sent. Duration: {duration:.2f}s ---")
         
-        # Calculate remaining sleep time to maintain 15-minute interval
-        sleep_duration = 900 - duration
+        # Calculate remaining sleep time to maintain the 5-minute interval
+        sleep_duration = CHECK_INTERVAL_SECONDS - duration
         if sleep_duration > 0:
             print(f"Sleeping for {sleep_duration:.0f} seconds.")
             time.sleep(sleep_duration)
         else:
-            print("WARNING: Stock check took longer than 15 minutes. Running next cycle immediately.")
+            print(f"WARNING: Stock check took longer than {CHECK_INTERVAL_SECONDS} seconds. Running next cycle immediately.")
             time.sleep(5) # Short pause before starting next cycle
 
 
-# --- Run Application ---
+# --- Run Application (No Change) ---
 if __name__ == '__main__':
     if waitlist_collection is not None:
-        # FIX: Changed 'Thread.enumerate()' to 'threading.enumerate()'
+        # Check if thread is already running (e.g., if reloader is on)
         if not any(t.name == 'StockCheckerThread' for t in threading.enumerate()):
             stock_thread = threading.Thread(target=stock_checker_task, name='StockCheckerThread')
             stock_thread.daemon = True 
