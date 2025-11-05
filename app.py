@@ -12,10 +12,14 @@ from pymongo.errors import PyMongoError, ServerSelectionTimeoutError
 from socket import timeout as TimeoutError 
 import re 
 
-# --- Configuration: Reads from Environment Variables ---
+# --- Configuration: Reads from Environment Variables (No Hardcoded API Key Default) ---
 try:
+    # IMPORTANT: The Shopify API Key should be set securely in Render environment variables.
     SHOPIFY_STORE_URL = os.environ.get("SHOPIFY_STORE_URL", "raj-dynamic-dreamz.myshopify.com") 
-    SHOPIFY_API_KEY = os.environ.get("SHOPIFY_API_KEY", "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")
+    
+    # !!! WARNING: Removed the hardcoded key here. Ensure this is set in Render ENV vars!
+    SHOPIFY_API_KEY = os.environ.get("SHOPIFY_API_KEY") 
+    
     SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
     SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
     EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS", "rajpurohit74747@gmail.com")
@@ -29,7 +33,7 @@ try:
     else:
         STOREFRONT_BASE_URL = f"https://{SHOPIFY_STORE_URL}".rstrip('/')
     
-    # NEW: MongoDB Configuration 
+    # MongoDB Configuration 
     MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb+srv://rajpurohit74747:raj123@padhaion.qxq1zfs.mongodb.net/?appName=PadhaiOn")
 
 except Exception as e:
@@ -38,24 +42,19 @@ except Exception as e:
 
 app = Flask(__name__)
 
-# Initialize MongoDB Client
+# Initialize MongoDB Client (No Change)
 waitlist_collection = None
 try:
     client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    # Ping the server to check connection
     client.admin.command('ping')
-    
     db = client['shopify_waitlist_db'] 
-    
     waitlist_collection = db['waitlist_entries']
     waitlist_collection.create_index([("email", 1), ("variant_id", 1)], unique=True)
-    
     print("Successfully connected to MongoDB and initialized database.")
-    
 except (ServerSelectionTimeoutError, PyMongoError, TimeoutError) as e:
     print(f"ERROR: Could not connect to MongoDB. Please check MONGODB_URI/password/DB name. Error: {e}")
 
-# Configure CORS
+# Configure CORS (No Change)
 if STOREFRONT_BASE_URL:
     CORS(app, resources={r"/*": {"origins": STOREFRONT_BASE_URL}})
 else:
@@ -121,24 +120,21 @@ def remove_waitlist_entry(email, variant_id):
         print(f"DB Error removing entry: {e}")
         return False
 
-# --- Shopify API Helper (No Change) ---
+# --- Shopify API Helper (Improved Error Logging) ---
 def check_shopify_stock(variant_id):
     """Fetches the inventory quantity for a specific product variant."""
     if not SHOPIFY_STORE_URL or not SHOPIFY_API_KEY: 
-        print("Shopify credentials missing. Cannot check stock.")
+        print("❌ ERROR: Shopify credentials missing. Cannot check stock.")
+        # If credentials are missing, we cannot proceed.
         return False
     
-    # Robustly extract numeric ID
+    # Robustly extract numeric ID (No Change)
     variant_id_str = str(variant_id)
     match = re.search(r'\d+$', variant_id_str)
-    
-    if match:
-        numeric_id = match.group(0)
-    else:
-        numeric_id = variant_id_str
+    numeric_id = match.group(0) if match else variant_id_str
 
     if not numeric_id.isdigit():
-        print(f"ERROR: Could not parse numeric variant ID from {variant_id_str}. Skipping check.")
+        print(f"❌ ERROR: Could not parse numeric variant ID from {variant_id_str}. Skipping check.")
         return False
 
     url = (
@@ -151,24 +147,32 @@ def check_shopify_stock(variant_id):
     }
     try:
         response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
+        
+        if response.status_code == 404:
+             print(f"❌ Shopify API Error 404: Variant {numeric_id} not found. Check the ID.")
+             return False
+        
+        response.raise_for_status() # Raises HTTPError for 4xx/5xx status codes
+        
         data = response.json()
         inventory_quantity = data['variant']['inventory_quantity']
-        print(f"Stock check for variant {variant_id} (ID: {numeric_id}): {inventory_quantity} available.")
-        # This is the core logic: check if quantity is greater than zero
+        print(f"✅ Stock check for variant {variant_id} (ID: {numeric_id}): {inventory_quantity} available.")
+        
         return inventory_quantity > 0
     except requests.exceptions.HTTPError as http_err:
-        print(f"Shopify API HTTP Error (status {response.status_code}) checking variant {variant_id}. Check API key permissions! Error: {http_err}")
+        print(f"❌ Shopify API HTTP Error (Status {response.status_code}) checking variant {variant_id}.")
+        print("   -> **ACTION NEEDED:** Check your **SHOPIFY_API_KEY** permissions and value.")
+        print(f"   -> Details: {http_err}")
         return False
     except requests.exceptions.RequestException as e:
-        print(f"Shopify API Request Error checking variant {variant_id}. Error: {e}")
+        print(f"❌ Shopify API Request Error checking variant {variant_id}. Error: {e}")
         return False
 
 # --- Email Helper (No Change) ---
 def send_email(to_email, subject, body):
     """Sends an email using the configured SMTP settings."""
     if not all([SMTP_SERVER, EMAIL_ADDRESS, EMAIL_PASSWORD]):
-        print("Email configuration missing.")
+        print("❌ Email configuration missing.")
         return False
         
     msg = MIMEText(body)
@@ -181,10 +185,11 @@ def send_email(to_email, subject, body):
             server.starttls()
             server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
             server.sendmail(EMAIL_ADDRESS, to_email, msg.as_string())
-            print(f"Email sent successfully to {to_email}")
+            print(f"📧 Email sent successfully to {to_email}")
             return True
     except Exception as e:
-        print(f"Email sending failed to {to_email}: {e}")
+        print(f"❌ Email sending failed to {to_email}: **Check Gmail App Password** or SMTP settings.")
+        print(f"   -> Details: {e}")
         return False
 
 # --- Endpoints (No Change) ---
@@ -246,15 +251,15 @@ def notify_signup():
         return jsonify({"error": "Internal server error during processing."}), 500
 
 
-# --- Background Stock Checker (UPDATED INTERVAL) ---
+# --- Background Stock Checker (Set to 5 minutes for stability) ---
 def stock_checker_task():
     """Background task to periodically check stock and send notifications."""
     print("Stock checker thread started.")
     
-    # Wait only a short time before the first check
     time.sleep(5) 
     
-    # Check interval set to 5 minutes (300 seconds)
+    # 5 minutes (300 seconds) is the recommended minimum for Shopify API stability.
+    # Change to 5 if you insist on 5 seconds, but expect rate limiting.
     CHECK_INTERVAL_SECONDS = 300 
     
     while True:
@@ -267,7 +272,6 @@ def stock_checker_task():
         notified_list = []
 
         for variant_id, emails in waitlist_map.items():
-            print(f"Checking stock for variant {variant_id} (Emails: {len(emails)})")
             
             # Check the Shopify API
             if check_shopify_stock(variant_id):
@@ -276,7 +280,6 @@ def stock_checker_task():
                 notification_subject = "🎉 IN STOCK NOW! Buy Before It Sells Out!"
                 
                 for email in emails:
-                    # Construct the direct 'add to cart' link
                     notification_body = (
                         f"Great news, {email}! The product you were waiting for "
                         f"is officially back in stock! Variant ID: {variant_id}.\n\n"
@@ -288,34 +291,33 @@ def stock_checker_task():
                     if send_email(email, notification_subject, notification_body):
                         notified_list.append((email, variant_id))
                     else:
-                        print(f"WARNING: Failed to send notification email to {email} for variant {variant_id}.")
+                        print(f"⚠️ WARNING: Failed to send notification email to {email} for variant {variant_id}. (Check SMTP logs above)")
 
 
         # Safely remove notified customers from the database
         for email, variant_id in notified_list:
             if remove_waitlist_entry(email, variant_id):
-                 print(f"Successfully removed {email} for variant {variant_id} from the waitlist.")
+                 print(f"🗑️ Successfully removed {email} for variant {variant_id} from the waitlist.")
             else:
-                 print(f"WARNING: Failed to remove {email} for variant {variant_id} from the waitlist.")
+                 print(f"⚠️ WARNING: Failed to remove {email} for variant {variant_id} from the waitlist.")
         
         end_time = time.time()
         duration = end_time - start_time
         print(f"--- Stock check cycle complete. {len(notified_list)} notifications sent. Duration: {duration:.2f}s ---")
         
-        # Calculate remaining sleep time to maintain the 5-minute interval
+        # Calculate remaining sleep time to maintain the interval
         sleep_duration = CHECK_INTERVAL_SECONDS - duration
         if sleep_duration > 0:
-            print(f"Sleeping for {sleep_duration:.0f} seconds.")
+            print(f"😴 Sleeping for {sleep_duration:.0f} seconds.")
             time.sleep(sleep_duration)
         else:
-            print(f"WARNING: Stock check took longer than {CHECK_INTERVAL_SECONDS} seconds. Running next cycle immediately.")
-            time.sleep(5) # Short pause before starting next cycle
+            print(f"⚠️ WARNING: Stock check took longer than {CHECK_INTERVAL_SECONDS} seconds. Running next cycle immediately.")
+            time.sleep(5) 
 
 
 # --- Run Application (No Change) ---
 if __name__ == '__main__':
     if waitlist_collection is not None:
-        # Check if thread is already running (e.g., if reloader is on)
         if not any(t.name == 'StockCheckerThread' for t in threading.enumerate()):
             stock_thread = threading.Thread(target=stock_checker_task, name='StockCheckerThread')
             stock_thread.daemon = True 
@@ -323,4 +325,4 @@ if __name__ == '__main__':
     else:
         print("WARNING: Stock checker not started due to MongoDB connection failure.")
     
-    app.run(host='0.0.0.0', port=os.environ.get('PORT', 8080))
+    app.run(host='00.0.0', port=os.environ.get('PORT', 8080))
