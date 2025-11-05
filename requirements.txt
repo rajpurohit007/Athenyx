@@ -1,3 +1,4 @@
 Flask
 requests
-gunicorn # Recommended for production deployment on Render
+gunicorn
+flask-cors# Recommended for production deployment on Render
