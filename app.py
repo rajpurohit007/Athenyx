@@ -10,7 +10,7 @@ import json
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError, ServerSelectionTimeoutError 
 from socket import timeout as TimeoutError 
-
+import re # Import regex for robust ID extraction
 
 # --- Configuration: Reads from Environment Variables ---
 try:
@@ -39,7 +39,6 @@ try:
     # Ping the server to check connection
     client.admin.command('ping')
     
-    # FIX: Explicitly specify the database name
     db = client['shopify_waitlist_db'] 
     
     waitlist_collection = db['waitlist_entries']
@@ -56,11 +55,11 @@ if STOREFRONT_BASE_URL:
 else:
     CORS(app) 
 
-# --- Database Helpers ---
+# --- Database Helpers (Unchanged from previous fix) ---
 
 def is_subscribed(email, variant_id):
     """Checks if a customer is already subscribed for a specific variant."""
-    if waitlist_collection is None: return False # FIXED: Use 'is None'
+    if waitlist_collection is None: return False 
     try:
         return waitlist_collection.find_one({'email': email, 'variant_id': str(variant_id)}) is not None
     except PyMongoError as e:
@@ -70,7 +69,7 @@ def is_subscribed(email, variant_id):
 
 def add_waitlist_entry(email, variant_id):
     """Adds or updates a waitlist entry, ensuring uniqueness."""
-    if waitlist_collection is None: # FIXED: Use 'is None'
+    if waitlist_collection is None: 
         print("DB Not Connected.")
         return False
     try:
@@ -86,7 +85,7 @@ def add_waitlist_entry(email, variant_id):
 
 def get_waitlist_entries():
     """Retrieves all unique variant IDs and the emails waiting for them."""
-    if waitlist_collection is None: # FIXED: Use 'is None'
+    if waitlist_collection is None: 
         return {}
     
     try:
@@ -108,7 +107,7 @@ def get_waitlist_entries():
 
 def remove_waitlist_entry(email, variant_id):
     """Removes a customer from a specific product's waitlist."""
-    if waitlist_collection is None: return False # FIXED: Use 'is None'
+    if waitlist_collection is None: return False 
     try:
         waitlist_collection.delete_one({'email': email, 'variant_id': str(variant_id)})
         return True
@@ -116,14 +115,30 @@ def remove_waitlist_entry(email, variant_id):
         print(f"DB Error removing entry: {e}")
         return False
 
-# --- Shopify API Helper (Unchanged) ---
+# --- Shopify API Helper (MODIFIED) ---
 def check_shopify_stock(variant_id):
     """Fetches the inventory quantity for a specific product variant."""
     if not SHOPIFY_STORE_URL or not SHOPIFY_API_KEY: return False
-    numeric_id = str(variant_id).split('/')[-1]
+    
+    # --- FIX 1: Robustly extract numeric ID ---
+    # Attempt to extract the numeric ID, handling both full GID and numeric strings.
+    variant_id_str = str(variant_id)
+    match = re.search(r'\d+$', variant_id_str)
+    
+    if match:
+        numeric_id = match.group(0)
+    else:
+        # Fallback if the variant_id itself is expected to be the numeric ID.
+        # This covers cases where only the number (e.g., 54378128310563) is stored.
+        numeric_id = variant_id_str
+
+    if not numeric_id.isdigit():
+        print(f"ERROR: Could not parse numeric variant ID from {variant_id_str}. Skipping check.")
+        return False
+
     url = (
         f"https://{SHOPIFY_STORE_URL}/admin/api/{SHOPIFY_API_VERSION}"
-        f"/variants/{numeric_id}.json"
+        f"/variants/{numeric_id}.json" # Use the cleaned numeric_id here
     )
     headers = {
         "Content-Type": "application/json",
@@ -134,10 +149,14 @@ def check_shopify_stock(variant_id):
         response.raise_for_status()
         data = response.json()
         inventory_quantity = data['variant']['inventory_quantity']
-        print(f"Stock check for variant {variant_id}: {inventory_quantity} available.")
+        print(f"Stock check for variant {variant_id} (ID: {numeric_id}): {inventory_quantity} available.")
         return inventory_quantity > 0
+    except requests.exceptions.HTTPError as http_err:
+        print(f"Shopify API HTTP Error (status {response.status_code}) checking variant {variant_id}. Error: {http_err}")
+        # Common issue: If the key is invalid or permissions are wrong, it fails here.
+        return False
     except requests.exceptions.RequestException as e:
-        print(f"Shopify API Error checking variant {variant_id}. Error: {e}")
+        print(f"Shopify API Request Error checking variant {variant_id}. Error: {e}")
         return False
 
 # --- Email Helper (Unchanged) ---
@@ -162,7 +181,7 @@ def send_email(to_email, subject, body):
     except Exception as e:
         print(f"Email sending failed to {to_email}: {e}")
         return False
-# --- Endpoints ---
+# --- Endpoints (Unchanged) ---
 
 @app.route('/', methods=['GET'])
 def home():
@@ -171,7 +190,7 @@ def home():
 
 @app.route('/check-subscription', methods=['GET'])
 def check_subscription():
-    """NEW ENDPOINT: Checks subscription status for a logged-in user."""
+    """Checks subscription status for a logged-in user."""
     email = request.args.get('email')
     variant_id = request.args.get('variant_id')
 
@@ -221,19 +240,25 @@ def notify_signup():
         return jsonify({"error": "Internal server error during processing."}), 500
 
 
-# --- Background Stock Checker ---
+# --- Background Stock Checker (IMPROVED LOGGING) ---
 def stock_checker_task():
     """Background task to periodically check stock and send notifications."""
     print("Stock checker thread started.")
-    time.sleep(60)
+    # Check immediately after a minute, then every 15 minutes
+    time.sleep(60) 
     
     while True:
+        start_time = time.time()
+        print(f"--- Starting stock check cycle at {time.ctime(start_time)} ---")
+        
         waitlist_map = get_waitlist_entries()
-        print(f"Starting stock check cycle. Checking {len(waitlist_map)} unique variants.")
+        print(f"Checking waitlist for {len(waitlist_map)} unique variants.")
         
         notified_list = []
 
         for variant_id, emails in waitlist_map.items():
+            print(f"Checking stock for variant {variant_id} (Emails: {len(emails)})")
+            
             if check_shopify_stock(variant_id):
                 print(f"Variant {variant_id} is IN STOCK. Notifying {len(emails)} customers.")
                 
@@ -250,21 +275,39 @@ def stock_checker_task():
                     
                     if send_email(email, notification_subject, notification_body):
                         notified_list.append((email, variant_id))
+                    else:
+                        print(f"WARNING: Failed to send notification email to {email} for variant {variant_id}.")
+
 
         # Safely remove notified customers from the database
         for email, variant_id in notified_list:
-            remove_waitlist_entry(email, variant_id)
+            if remove_waitlist_entry(email, variant_id):
+                 print(f"Successfully removed {email} for variant {variant_id} from the waitlist.")
+            else:
+                 print(f"WARNING: Failed to remove {email} for variant {variant_id} from the waitlist.")
         
-        print(f"Stock check cycle complete. {len(notified_list)} notifications sent and removed from DB.")
-        time.sleep(900) # Check stock every 15 minutes
+        end_time = time.time()
+        duration = end_time - start_time
+        print(f"--- Stock check cycle complete. {len(notified_list)} notifications sent. Duration: {duration:.2f}s ---")
+        
+        # Calculate remaining sleep time to maintain 15-minute interval
+        sleep_duration = 900 - duration
+        if sleep_duration > 0:
+            print(f"Sleeping for {sleep_duration:.0f} seconds.")
+            time.sleep(sleep_duration)
+        else:
+            print("WARNING: Stock check took longer than 15 minutes. Running next cycle immediately.")
+            time.sleep(5) # Short pause before starting next cycle
 
 
-# --- Run Application ---
+# --- Run Application (Unchanged) ---
 if __name__ == '__main__':
     if waitlist_collection is not None:
-        stock_thread = Thread(target=stock_checker_task)
-        stock_thread.daemon = True 
-        stock_thread.start()
+        # Check if thread is already running (e.g., if reloader is on)
+        if not any(t.name == 'StockCheckerThread' for t in Thread.enumerate()):
+            stock_thread = Thread(target=stock_checker_task, name='StockCheckerThread')
+            stock_thread.daemon = True 
+            stock_thread.start()
     else:
         print("WARNING: Stock checker not started due to MongoDB connection failure.")
     
