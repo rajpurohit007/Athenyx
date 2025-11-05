@@ -1,4 +1,4 @@
 Flask
 requests
 gunicorn
-flask-cors# Recommended for production deployment on Render
+flask-cors  # <--- MUST be present
