@@ -3,7 +3,7 @@ from flask_cors import CORS
 import requests
 import smtplib
 from email.mime.text import MIMEText
-from threading import Thread
+import threading # Use 'threading' module for enumerate
 import time
 import os
 import json
@@ -21,7 +21,13 @@ try:
     EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS", "rajpurohit74747@gmail.com")
     EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "vvhj rkau nncu ugdj") # App Password
     SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2023-10") 
-    STOREFRONT_BASE_URL = os.environ.get("STOREFRONT_BASE_URL", f"https://{SHOPIFY_STORE_URL}")
+    
+    # Safely construct base URL for storefront links
+    storefront_base_url_env = os.environ.get("STOREFRONT_BASE_URL")
+    if storefront_base_url_env:
+        STOREFRONT_BASE_URL = storefront_base_url_env.rstrip('/')
+    else:
+        STOREFRONT_BASE_URL = f"https://{SHOPIFY_STORE_URL}".rstrip('/')
     
     # NEW: MongoDB Configuration 
     MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb+srv://rajpurohit74747:raj123@padhaion.qxq1zfs.mongodb.net/?appName=PadhaiOn")
@@ -55,7 +61,7 @@ if STOREFRONT_BASE_URL:
 else:
     CORS(app) 
 
-# --- Database Helpers (Unchanged from previous fix) ---
+# --- Database Helpers ---
 
 def is_subscribed(email, variant_id):
     """Checks if a customer is already subscribed for a specific variant."""
@@ -115,21 +121,20 @@ def remove_waitlist_entry(email, variant_id):
         print(f"DB Error removing entry: {e}")
         return False
 
-# --- Shopify API Helper (MODIFIED) ---
+# --- Shopify API Helper ---
 def check_shopify_stock(variant_id):
     """Fetches the inventory quantity for a specific product variant."""
-    if not SHOPIFY_STORE_URL or not SHOPIFY_API_KEY: return False
+    if not SHOPIFY_STORE_URL or not SHOPIFY_API_KEY: 
+        print("Shopify credentials missing. Cannot check stock.")
+        return False
     
-    # --- FIX 1: Robustly extract numeric ID ---
-    # Attempt to extract the numeric ID, handling both full GID and numeric strings.
+    # Robustly extract numeric ID
     variant_id_str = str(variant_id)
     match = re.search(r'\d+$', variant_id_str)
     
     if match:
         numeric_id = match.group(0)
     else:
-        # Fallback if the variant_id itself is expected to be the numeric ID.
-        # This covers cases where only the number (e.g., 54378128310563) is stored.
         numeric_id = variant_id_str
 
     if not numeric_id.isdigit():
@@ -138,7 +143,7 @@ def check_shopify_stock(variant_id):
 
     url = (
         f"https://{SHOPIFY_STORE_URL}/admin/api/{SHOPIFY_API_VERSION}"
-        f"/variants/{numeric_id}.json" # Use the cleaned numeric_id here
+        f"/variants/{numeric_id}.json"
     )
     headers = {
         "Content-Type": "application/json",
@@ -152,14 +157,13 @@ def check_shopify_stock(variant_id):
         print(f"Stock check for variant {variant_id} (ID: {numeric_id}): {inventory_quantity} available.")
         return inventory_quantity > 0
     except requests.exceptions.HTTPError as http_err:
-        print(f"Shopify API HTTP Error (status {response.status_code}) checking variant {variant_id}. Error: {http_err}")
-        # Common issue: If the key is invalid or permissions are wrong, it fails here.
+        print(f"Shopify API HTTP Error (status {response.status_code}) checking variant {variant_id}. Check API key permissions! Error: {http_err}")
         return False
     except requests.exceptions.RequestException as e:
         print(f"Shopify API Request Error checking variant {variant_id}. Error: {e}")
         return False
 
-# --- Email Helper (Unchanged) ---
+# --- Email Helper ---
 def send_email(to_email, subject, body):
     """Sends an email using the configured SMTP settings."""
     if not all([SMTP_SERVER, EMAIL_ADDRESS, EMAIL_PASSWORD]):
@@ -181,6 +185,7 @@ def send_email(to_email, subject, body):
     except Exception as e:
         print(f"Email sending failed to {to_email}: {e}")
         return False
+
 # --- Endpoints (Unchanged) ---
 
 @app.route('/', methods=['GET'])
@@ -240,11 +245,10 @@ def notify_signup():
         return jsonify({"error": "Internal server error during processing."}), 500
 
 
-# --- Background Stock Checker (IMPROVED LOGGING) ---
+# --- Background Stock Checker ---
 def stock_checker_task():
     """Background task to periodically check stock and send notifications."""
     print("Stock checker thread started.")
-    # Check immediately after a minute, then every 15 minutes
     time.sleep(60) 
     
     while True:
@@ -300,12 +304,12 @@ def stock_checker_task():
             time.sleep(5) # Short pause before starting next cycle
 
 
-# --- Run Application (Unchanged) ---
+# --- Run Application ---
 if __name__ == '__main__':
     if waitlist_collection is not None:
-        # Check if thread is already running (e.g., if reloader is on)
-        if not any(t.name == 'StockCheckerThread' for t in Thread.enumerate()):
-            stock_thread = Thread(target=stock_checker_task, name='StockCheckerThread')
+        # FIX: Changed 'Thread.enumerate()' to 'threading.enumerate()'
+        if not any(t.name == 'StockCheckerThread' for t in threading.enumerate()):
+            stock_thread = threading.Thread(target=stock_checker_task, name='StockCheckerThread')
             stock_thread.daemon = True 
             stock_thread.start()
     else:
