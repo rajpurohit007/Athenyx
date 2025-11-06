@@ -1,16 +1,20 @@
 import os
 import requests
-from flask import Flask, render_template, jsonify, request
+import json
+import hmac
+import hashlib
+from flask import Flask, render_template, jsonify, request, abort
 from flask_mail import Mail, Message
 from pymongo import MongoClient
 from datetime import datetime
-# ADDED: APScheduler for scheduling the inventory check
-from flask_apscheduler import APScheduler 
 
 # --- CONFIGURATION (YOUR ACTUAL VALUES) ---
 SHOPIFY_STORE_NAME = "raj-dynamic-dreamz"
 SHOPIFY_API_VERSION = "2024-10"
 SHOPIFY_ACCESS_TOKEN = "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" 
+
+# IMPORTANT: You MUST set this secret in your Shopify Webhook setup!
+SHOPIFY_WEBHOOK_SECRET = "my_super_secret_alert_key" # <-- CHANGE THIS TO A SECURE RANDOM STRING
 
 MONGO_URI = "mongodb+srv://rajpurohit74747:raj123@padhaion.qxq1zfs.mongodb.net/?retryWrites=true&w=majority&appName=PadhaiOn"
 MONGO_DB_NAME = "shopify_waitlist_db"
@@ -36,24 +40,6 @@ app.config.update(
 )
 mail = Mail(app)
 
-# APScheduler Configuration
-class Config:
-    SCHEDULER_API_ENABLED = True
-    # Run the check every 5 minutes (adjust as needed)
-    SCHEDULER_JOB_DEFAULTS = {
-        'coalesce': True,
-        'max_instances': 1
-    }
-    SCHEDULER_EXECUTORS = {
-        'default': {'type': 'threadpool', 'max_workers': 20}
-    }
-    SCHEDULER_JOBSTORES = {
-        'default': {'type': 'memory'}
-    }
-
-app.config.from_object(Config())
-scheduler = APScheduler()
-
 # MongoDB Setup
 try:
     client = MongoClient(MONGO_URI)
@@ -65,88 +51,135 @@ except Exception as e:
     client = None
     subscribers_collection = None
 
-# --- APSCHEDULER JOB: THE AUTOMATION CORE ---
+# --- WEBHOOK SECURITY FUNCTION ---
 
-def get_restock_check_threshold():
-    """Sets a minimum quantity for restock (e.g., 1 or 5)"""
-    return 1 # Alert when stock is 1 or more
-
-# ADDED: This function runs automatically on a schedule
-def check_inventory_and_send_alerts():
-    """
-    1. Fetches current Shopify inventory.
-    2. Compares against subscribed variant IDs.
-    3. Sends alerts for restocked items and removes subscriptions.
-    """
-    if subscribers_collection is None:
-        print("ALERT JOB FAILED: MongoDB not connected.")
-        return
-
-    print(f"--- Running Automated Inventory Check at {datetime.now()} ---")
+def verify_webhook_hmac(data, hmac_header):
+    """Verifies that the incoming request is truly from Shopify."""
+    if not SHOPIFY_WEBHOOK_SECRET:
+        print("Webhook secret not configured!")
+        return False
+        
+    encoded_secret = SHOPIFY_WEBHOOK_SECRET.encode('utf-8')
+    digest = hmac.new(encoded_secret, data, hashlib.sha256).hexdigest()
     
-    # 1. Fetch ALL current product data from Shopify
-    products_data = fetch_shopify_product_data()
+    return hmac.compare_digest(digest, hmac_header)
+
+# --- WEBHOOK ENDPOINT: INSTANT ALERT LOGIC ---
+
+@app.route('/webhook/inventory-update', methods=['POST'])
+def inventory_webhook():
+    """Receives data instantly from Shopify when inventory changes."""
     
-    # 2. Identify variants that are currently in stock (or above threshold)
-    restocked_variants = {
-        p['variant_id']: p for p in products_data 
-        if p['inventory'] >= get_restock_check_threshold()
+    # 1. Get raw data and HMAC header for verification
+    data = request.get_data()
+    hmac_header = request.headers.get('X-Shopify-Hmac-Sha256')
+
+    # 2. SECURITY CHECK: Verify the request origin
+    if not verify_webhook_hmac(data, hmac_header):
+        print("SECURITY ALERT: HMAC verification failed for incoming webhook.")
+        abort(401) # Unauthorized
+
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        print("Failed to parse JSON payload.")
+        abort(400) # Bad Request
+
+    # 3. Extract necessary data from the payload (this webhook gives location-specific inventory)
+    variant_id = str(payload.get('variant_id'))
+    inventory_quantity = payload.get('available') # 'available' refers to inventory at this location
+    
+    print(f"Webhook received for Variant ID: {variant_id}. New Quantity: {inventory_quantity}")
+
+    # 4. Check Restock Condition
+    RESTOCK_THRESHOLD = 1
+    if inventory_quantity < RESTOCK_THRESHOLD:
+        print("Quantity is below restock threshold. Skipping alerts.")
+        return jsonify({"status": "ok", "message": "Not enough stock to alert."}), 200
+
+    # 5. Get subscribers for this variant
+    subscribers = get_subscribers_for_variant(variant_id)
+    
+    if not subscribers:
+        print(f"No subscribers found for restocked variant {variant_id}.")
+        return jsonify({"status": "ok", "message": "No subscribers found."}), 200
+
+    # 6. Fetch Product Details (We need title, handle, etc., which aren't in the inventory webhook)
+    product_details = get_product_details_by_variant_id(variant_id)
+
+    if not product_details:
+        print(f"Could not fetch product details for variant {variant_id}.")
+        return jsonify({"status": "ok", "message": "Product details missing."}), 200
+
+    # 7. Send Alerts and Delete Subscriptions
+    total_alerts_sent = 0
+    for email in subscribers:
+        if send_restock_email(
+            email, 
+            product_details['product_title'], 
+            product_details['variant_title'], 
+            product_details['product_handle']
+        ):
+            total_alerts_sent += 1
+            # CRUCIAL: REMOVE SUBSCRIPTION
+            subscribers_collection.delete_one({
+                "email": email, 
+                "variant_id": str(variant_id)
+            })
+            
+    return jsonify({
+        "status": "ok", 
+        "message": f"Alerts processed for variant {variant_id}. Sent {total_alerts_sent} emails."
+    }), 200
+
+
+# --- NEW HELPER FUNCTION TO GET PRODUCT DETAILS ---
+
+def get_product_details_by_variant_id(variant_id):
+    """
+    Fetches the necessary product/variant details (like title and handle) 
+    for the email template, as the inventory webhook only provides IDs and quantity.
+    """
+    url = f"https://{SHOPIFY_STORE_NAME}.myshopify.com/admin/api/{SHOPIFY_API_VERSION}/variants/{variant_id}.json"
+    headers = {
+        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN
     }
     
-    if not restocked_variants:
-        print("No restocked variants found above threshold. Skipping alerts.")
-        return
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        variant_data = data.get('variant', {})
         
-    # 3. Process alerts for restocked variants
-    total_alerts_sent = 0
-    total_subscriptions_removed = 0
-    
-    for variant_id, product in restocked_variants.items():
-        # Get all subscribers for this specific variant
-        subscribers = get_subscribers_for_variant(variant_id)
-        
-        if not subscribers:
-            continue
-            
-        print(f"Found {len(subscribers)} subscribers for restocked variant ID {variant_id} ({product['product_title']}).")
-        
-        # Send alerts
-        for email in subscribers:
-            if send_restock_email(email, product['product_title'], product['variant_title'], product['product_handle']):
-                total_alerts_sent += 1
-                
-                # CRUCIAL STEP: REMOVE THE SUBSCRIPTION AFTER SENDING THE ALERT
-                # We assume a successful email means the user is notified.
-                subscribers_collection.delete_one({
-                    "email": email, 
-                    "variant_id": str(variant_id)
-                })
-                total_subscriptions_removed += 1
-            
-    print(f"--- Inventory Check Complete. Sent {total_alerts_sent} alerts and removed {total_subscriptions_removed} subscriptions. ---")
+        # Need to fetch the parent product data too to get the handle/title
+        product_id = variant_data.get('product_id')
+        if not product_id: return None
+
+        product_url = f"https://{SHOPIFY_STORE_NAME}.myshopify.com/admin/api/{SHOPIFY_API_VERSION}/products/{product_id}.json"
+        product_response = requests.get(product_url, headers=headers, timeout=5)
+        product_response.raise_for_status()
+        product_data = product_response.json().get('product', {})
+
+        return {
+            'product_title': product_data.get('title', 'Restocked Item'),
+            'product_handle': product_data.get('handle', ''),
+            'variant_title': variant_data.get('title', 'Default'),
+            'inventory': variant_data.get('inventory_quantity', 0)
+        }
+
+    except requests.exceptions.RequestException as e:
+        print(f"Shopify API (details fetch) failed: {e}")
+        return None
 
 
-# --- APScheduler Setup and Start ---
-if __name__ == '__main__':
-    # Initialize the scheduler
-    scheduler.init_app(app)
-    # Add the automated job: Run every 5 minutes
-    scheduler.add_job(
-        id='inventory_check', 
-        func=check_inventory_and_send_alerts, 
-        trigger='interval', 
-        minutes=5,
-        misfire_grace_time=300 # Allow job to run if missed by 5 minutes
-    )
-    scheduler.start()
-    
-    # When running locally, set debug=True. In production, use a WSGI server.
-    app.run(debug=True, use_reloader=False) # use_reloader=False is necessary with APScheduler
-
-# --- REMAINING FUNCTIONS (No changes needed, but included for completeness) ---
+# --- REMAINING FUNCTIONS (Minimal changes) ---
 
 def fetch_shopify_product_data():
-    """Fetches Product Variants, including the product handle for URL creation."""
+    """(Kept for the dashboard /api/products route)"""
+    # Fetching code remains the same as previous steps...
+    # NOTE: Since this is now only for the dashboard display, 
+    # we can remove the inventory check from here if needed, but keeping 
+    # the GraphQL query as-is is simpler for the dashboard.
     url = f"https://{SHOPIFY_STORE_NAME}.myshopify.com/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
     headers = {
         "Content-Type": "application/json",
@@ -178,6 +211,7 @@ def fetch_shopify_product_data():
     payload = {"query": query}
 
     try:
+        # ... (rest of the GraphQL execution logic) ...
         response = requests.post(url, headers=headers, json=payload, timeout=10)
         response.raise_for_status()
         data = response.json()
@@ -225,8 +259,9 @@ def get_subscribers_for_variant(variant_id):
         return []
 
 def send_restock_email(recipient_email, product_title, variant_title, product_handle):
-    """Sends a restock alert email, passing the product handle for the dynamic link."""
+    """Sends a restock alert email."""
     try:
+        # (Email sending logic remains the same)
         msg = Message(
             subject=f"In Stock Alert: {product_title} ({variant_title})",
             recipients=[recipient_email],
@@ -251,41 +286,6 @@ def send_restock_email(recipient_email, product_title, variant_title, product_ha
 def index():
     return render_template('index.html')
 
-# Removed the /api/send-alert route as it is now redundant, 
-# but I'll leave it in for now so your dashboard buttons still work manually.
-@app.route('/api/send-alert', methods=['POST'])
-def send_alert():
-    data = request.json
-    variant_id = data.get('variant_id')
-    product_title = data.get('product_title')
-    variant_title = data.get('variant_title')
-    product_handle = data.get('product_handle')
-
-    if not all([variant_id, product_title, variant_title, product_handle]):
-        return jsonify({"message": "Missing required variant data (including product_handle)."}), 400
-
-    subscribers = get_subscribers_for_variant(variant_id)
-    
-    if not subscribers:
-        return jsonify({"message": f"Alert sent, but no subscribers found in MongoDB for variant ID {variant_id}."}), 200
-
-    success_count = 0
-    fail_count = 0
-
-    for email in subscribers:
-        if send_restock_email(email, product_title, variant_title, product_handle):
-            success_count += 1
-            # OPTIONAL: You could remove the subscription here too after a manual send.
-        else:
-            fail_count += 1
-            
-    return jsonify({
-        "message": f"Manual Alert process completed for variant ID {variant_id}.",
-        "subscribers_found": len(subscribers),
-        "emails_sent_successfully": success_count,
-        "emails_failed": fail_count
-    }), 200
-
 @app.route('/api/products', methods=['GET'])
 def get_products():
     products = fetch_shopify_product_data()
@@ -294,16 +294,16 @@ def get_products():
     return jsonify(products)
 
 
+# NOTE: You can now remove /api/send-alert and /api/setup-db as the webhook handles the restock logic.
+# I will keep the setup-db for testing convenience, but remove the manual send-alert.
+
 @app.route('/api/setup-db', methods=['POST'])
 def setup_db():
-    """
-    (FOR DEMO ONLY) Adds a fake subscriber to the database 
-    to simulate a subscription, matching your uploaded schema.
-    """
     if subscribers_collection is None:
         return jsonify({"message": "MongoDB not connected."}), 500
 
-    variant_to_subscribe = "54378128310563"
+    # Ensure this variant ID exists and you can change its stock for testing!
+    variant_to_subscribe = "54378128310563" 
     test_email = "test@example.com"
     
     existing_subscription = subscribers_collection.find_one({
@@ -322,5 +322,9 @@ def setup_db():
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S") 
         })
         return jsonify({
-            "message": f"Test subscriber {test_email} created and subscribed to variant {variant_to_subscribe}. Use this variant ID for testing the 'Send Alert' button, or wait for the automated job."
+            "message": f"Test subscriber {test_email} created and subscribed to variant {variant_to_subscribe}. Use this variant ID for testing the webhook."
         })
+
+if __name__ == '__main__':
+    # We no longer need use_reloader=False as we removed APScheduler
+    app.run(debug=True)
