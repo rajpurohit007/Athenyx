@@ -14,7 +14,7 @@ SHOPIFY_API_VERSION = "2024-10"
 SHOPIFY_ACCESS_TOKEN = "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" 
 
 # IMPORTANT: You MUST set this secret in your Shopify Webhook setup!
-SHOPIFY_WEBHOOK_SECRET = "my_super_secret_alert_key" # <-- CHANGE THIS TO A SECURE RANDOM STRING
+SHOPIFY_WEBHOOK_SECRET = "3c3b8d61c508e9b950ca22a8e91cadc819491c5785dc35780af05002f5ca5e56 # <-- CHANGE THIS TO A SECURE RANDOM STRING
 
 MONGO_URI = "mongodb+srv://rajpurohit74747:raj123@padhaion.qxq1zfs.mongodb.net/?retryWrites=true&w=majority&appName=PadhaiOn"
 MONGO_DB_NAME = "shopify_waitlist_db"
