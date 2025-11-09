@@ -1,86 +1,145 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import requests
-import smtplib
-from email.mime.text import MIMEText
-import threading 
-import time
 import os
+import requests
 import json
+import smtplib
+import threading
+import time
+import re
+import hmac
+import hashlib
+import base64
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from flask import Flask, request, jsonify, Response, abort
+from flask_cors import CORS
 from pymongo import MongoClient
-from pymongo.errors import PyMongoError, ServerSelectionTimeoutError 
-from socket import timeout as TimeoutError 
-import re 
+from pymongo.errors import PyMongoError, ServerSelectionTimeoutError
+from datetime import datetime
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+from functools import wraps
 
-# --- Configuration: Reads from Environment Variables (No Hardcoded API Key Default) ---
+# --- Configuration: Reads from Environment Variables ---
 try:
-    # IMPORTANT: The Shopify API Key should be set securely in Render environment variables.
-    SHOPIFY_STORE_URL = os.environ.get("SHOPIFY_STORE_URL", "raj-dynamic-dreamz.myshopify.com") 
+    SHOPIFY_STORE_URL = os.environ.get("SHOPIFY_STORE_URL", "raj-dynamic-dreamz.myshopify.com")
+    SHOPIFY_API_KEY = os.environ.get("SHOPIFY_API_KEY", "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")
     
-    # !!! WARNING: Removed the hardcoded key here. Ensure this is set in Render ENV vars!
-    SHOPIFY_API_KEY = os.environ.get("5d9f422c303e02187b2442b1b68edf6a") 
-    
+    # --- !!! NEW AND CRITICAL !!! ---
+    # You get this from your Shopify Admin: Settings > Notifications > Webhooks
+    # It's the "signing key" shown after you create a webhook.
+    SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "YOUR_REAL_WEBHOOK_SECRET_KEY")
+    # -----------------------------------
+
     SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
     SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
     EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS", "rajpurohit74747@gmail.com")
-    EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "vvhj rkau nncu ugdj") # App Password
-    SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2023-10") 
-    
-    # Safely construct base URL for storefront links
-    storefront_base_url_env = os.environ.get("STOREFRONT_BASE_URL")
-    if storefront_base_url_env:
-        STOREFRONT_BASE_URL = storefront_base_url_env.rstrip('/')
-    else:
-        STOREFRONT_BASE_URL = f"https://{SHOPIFY_STORE_URL}".rstrip('/')
-    
-    # MongoDB Configuration 
+    EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "vvhj rkau nncu ugdj") # Gmail App Password
+    SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2023-10")
     MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb+srv://rajpurohit74747:raj123@padhaion.qxq1zfs.mongodb.net/?appName=PadhaiOn")
+
+    # Storefront URL for links
+    STOREFRONT_BASE_URL = f"https://{SHOPIFY_STORE_URL.rstrip('/')}"
+    # Admin API base URL
+    SHOPIFY_ADMIN_API_BASE_URL = (
+        f"https://{SHOPIFY_STORE_URL}/admin/api/{SHOPIFY_API_VERSION}"
+    )
 
 except Exception as e:
     print(f"FATAL ERROR: Failed to load environment variables. {e}")
-    
+    exit(1)
+
+# --- Jinja2 Environment Setup ---
+CONFIRMATION_TEMPLATE = None
+ALERT_TEMPLATE = None
+try:
+    template_loader = FileSystemLoader(searchpath="./")
+    jinja_env = Environment(
+        loader=template_loader,
+        autoescape=select_autoescape(['html', 'xml'])
+    )
+    CONFIRMATION_TEMPLATE = jinja_env.get_template("email_confirmation_template.html")
+    ALERT_TEMPLATE = jinja_env.get_template("email_alert_template.html")
+    print("✅ Successfully loaded email templates.")
+except Exception as e:
+    print(f"⚠️ WARNING: Could not load email templates. Emails will be plain text. Error: {e}")
+
 
 app = Flask(__name__)
 
-# Initialize MongoDB Client (No Change)
+# --- MongoDB Initialization ---
 waitlist_collection = None
 try:
     client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
     client.admin.command('ping')
-    db = client['shopify_waitlist_db'] 
+    db = client['shopify_waitlist_db']
     waitlist_collection = db['waitlist_entries']
+    # --- !!! UPDATED INDEX !!! ---
+    # We now index by inventory_item_id for fast webhook lookups
+    waitlist_collection.create_index([("inventory_item_id", 1)])
     waitlist_collection.create_index([("email", 1), ("variant_id", 1)], unique=True)
-    print("Successfully connected to MongoDB and initialized database.")
-except (ServerSelectionTimeoutError, PyMongoError, TimeoutError) as e:
-    print(f"ERROR: Could not connect to MongoDB. Please check MONGODB_URI/password/DB name. Error: {e}")
+    print("✅ Successfully connected to MongoDB.")
+except (ServerSelectionTimeoutError, PyMongoError) as e:
+    print(f"❌ ERROR: Could not connect to MongoDB. Service will not work. Error: {e}")
 
-# Configure CORS (No Change)
-if STOREFRONT_BASE_URL:
-    CORS(app, resources={r"/*": {"origins": STOREFRONT_BASE_URL}})
-else:
-    CORS(app) 
+# --- CORS Configuration ---
+CORS(app, resources={r"/*": {"origins": STOREFRONT_BASE_URL}})
 
-# --- Database Helpers (No Change) ---
 
+# --- Webhook Security (HMAC Verification) ---
+def verify_shopify_webhook(f):
+    """Decorator to verify incoming webhooks from Shopify."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # 1. Get the signature from the request header
+        hmac_header = request.headers.get('X-Shopify-Hmac-Sha256')
+        if not hmac_header:
+            print("❌ Webhook Error: Missing X-Shopify-Hmac-Sha256 header.")
+            abort(401)
+
+        # 2. Get the raw request body
+        data = request.get_data()
+
+        # 3. Verify the signature
+        try:
+            secret_bytes = SHOPIFY_WEBHOOK_SECRET.encode('utf-8')
+            digest = hmac.new(secret_bytes, data, hashlib.sha256).digest()
+            computed_hmac = base64.b64encode(digest)
+
+            if not hmac.compare_digest(computed_hmac, hmac_header.encode('utf-8')):
+                print("❌ Webhook Error: Invalid HMAC signature.")
+                abort(401)
+                
+        except Exception as e:
+            print(f"❌ Webhook Error: HMAC comparison failed. {e}")
+            abort(401)
+        
+        # 4. Pass the raw body data to the function
+        request.webhook_data = data
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+# --- Database Helpers ---
 def is_subscribed(email, variant_id):
-    """Checks if a customer is already subscribed for a specific variant."""
-    if waitlist_collection is None: return False 
+    if waitlist_collection is None: return False
     try:
         return waitlist_collection.find_one({'email': email, 'variant_id': str(variant_id)}) is not None
     except PyMongoError as e:
         print(f"DB Error checking subscription: {e}")
         return False
 
-
-def add_waitlist_entry(email, variant_id):
-    """Adds or updates a waitlist entry, ensuring uniqueness."""
-    if waitlist_collection is None: 
+# --- !!! UPDATED FUNCTION !!! ---
+def add_waitlist_entry(email, variant_id, inventory_item_id):
+    """Adds a new entry to the waitlist, now including the inventory_item_id."""
+    if waitlist_collection is None:
         print("DB Not Connected.")
         return False
     try:
         waitlist_collection.update_one(
             {'email': email, 'variant_id': str(variant_id)},
-            {'$set': {'timestamp': time.time()}},
+            {'$set': {
+                'timestamp': datetime.now(),
+                'inventory_item_id': str(inventory_item_id) # Store this for the webhook
+            }},
             upsert=True
         )
         return True
@@ -88,31 +147,20 @@ def add_waitlist_entry(email, variant_id):
         print(f"DB Error adding entry: {e}")
         return False
 
-def get_waitlist_entries():
-    """Retrieves all unique variant IDs and the emails waiting for them."""
-    if waitlist_collection is None: 
-        return {}
-    
+def get_waitlist_entries_by_inventory_id(inventory_item_id):
+    """Finds all users waiting for a specific inventory item."""
+    if waitlist_collection is None:
+        return []
     try:
-        pipeline = [
-            {
-                '$group': {
-                    '_id': '$variant_id',
-                    'emails': {'$addToSet': '$email'}
-                }
-            }
-        ]
-        results = list(waitlist_collection.aggregate(pipeline))
-        waitlist_map = {item['_id']: item['emails'] for item in results}
-        return waitlist_map
+        # Find all documents matching the inventory_item_id
+        entries = waitlist_collection.find({'inventory_item_id': str(inventory_item_id)})
+        return list(entries)
     except PyMongoError as e:
-        print(f"DB Error fetching waitlist: {e}")
-        return {}
-
+        print(f"DB Error fetching waitlist by inventory_id: {e}")
+        return []
 
 def remove_waitlist_entry(email, variant_id):
-    """Removes a customer from a specific product's waitlist."""
-    if waitlist_collection is None: return False 
+    if waitlist_collection is None: return False
     try:
         waitlist_collection.delete_one({'email': email, 'variant_id': str(variant_id)})
         return True
@@ -120,66 +168,91 @@ def remove_waitlist_entry(email, variant_id):
         print(f"DB Error removing entry: {e}")
         return False
 
-# --- Shopify API Helper (Improved Error Logging) ---
-def check_shopify_stock(variant_id):
-    """Fetches the inventory quantity for a specific product variant."""
-    if not SHOPIFY_STORE_URL or not SHOPIFY_API_KEY: 
-        print("❌ ERROR: Shopify credentials missing. Cannot check stock.")
-        # If credentials are missing, we cannot proceed.
-        return False
-    
-    # Robustly extract numeric ID (No Change)
-    variant_id_str = str(variant_id)
+# --- Shopify API Helpers ---
+def _get_numeric_variant_id(variant_id_str):
+    variant_id_str = str(variant_id_str)
     match = re.search(r'\d+$', variant_id_str)
     numeric_id = match.group(0) if match else variant_id_str
-
     if not numeric_id.isdigit():
-        print(f"❌ ERROR: Could not parse numeric variant ID from {variant_id_str}. Skipping check.")
-        return False
+        return None
+    return numeric_id
 
-    url = (
-        f"https://{SHOPIFY_STORE_URL}/admin/api/{SHOPIFY_API_VERSION}"
-        f"/variants/{numeric_id}.json"
-    )
+def _make_shopify_api_request(url):
+    if not SHOPIFY_STORE_URL or not SHOPIFY_API_KEY:
+        print("❌ ERROR: Shopify credentials missing.")
+        return None
     headers = {
         "Content-Type": "application/json",
         "X-Shopify-Access-Token": SHOPIFY_API_KEY
     }
     try:
         response = requests.get(url, headers=headers, timeout=10)
-        
-        if response.status_code == 404:
-             print(f"❌ Shopify API Error 404: Variant {numeric_id} not found. Check the ID.")
-             return False
-        
-        response.raise_for_status() # Raises HTTPError for 4xx/5xx status codes
-        
-        data = response.json()
-        inventory_quantity = data['variant']['inventory_quantity']
-        print(f"✅ Stock check for variant {variant_id} (ID: {numeric_id}): {inventory_quantity} available.")
-        
-        return inventory_quantity > 0
-    except requests.exceptions.HTTPError as http_err:
-        print(f"❌ Shopify API HTTP Error (Status {response.status_code}) checking variant {variant_id}.")
-        print("   -> **ACTION NEEDED:** Check your **SHOPIFY_API_KEY** permissions and value.")
-        print(f"   -> Details: {http_err}")
-        return False
+        response.raise_for_status()
+        return response.json()
     except requests.exceptions.RequestException as e:
-        print(f"❌ Shopify API Request Error checking variant {variant_id}. Error: {e}")
-        return False
+        print(f"❌ Shopify API Request Error: {e}")
+        return None
 
-# --- Email Helper (No Change) ---
-def send_email(to_email, subject, body):
-    """Sends an email using the configured SMTP settings."""
+# --- !!! UPDATED FUNCTION !!! ---
+def get_variant_details_for_signup(variant_id):
+    """
+    Fetches the variant details on signup to get the inventory_item_id.
+    """
+    numeric_id = _get_numeric_variant_id(variant_id)
+    if not numeric_id:
+        return None
+
+    # We only need the inventory_item_id from the variant
+    url = f"{SHOPIFY_ADMIN_API_BASE_URL}/variants/{numeric_id}.json?fields=inventory_item_id"
+    data = _make_shopify_api_request(url)
+    
+    if data and 'variant' in data and 'inventory_item_id' in data['variant']:
+        return data['variant']
+        
+    print(f"Could not verify variant for signup: {numeric_id}.")
+    return None
+
+def get_product_details_for_notification(variant_id):
+    """Fetches all product/variant details needed for the email template."""
+    numeric_id = _get_numeric_variant_id(variant_id)
+    if not numeric_id:
+        return None
+
+    variant_url = f"{SHOPIFY_ADMIN_API_BASE_URL}/variants/{numeric_id}.json?fields=product_id,title"
+    variant_data = _make_shopify_api_request(variant_url)
+    
+    if not variant_data or 'variant' not in variant_data:
+        return None
+
+    product_id = variant_data['variant']['product_id']
+    variant_title = variant_data['variant']['title']
+
+    product_url = f"{SHOPIFY_ADMIN_API_BASE_URL}/products/{product_id}.json?fields=title,handle"
+    product_data = _make_shopify_api_request(product_url)
+
+    if not product_data or 'product' not in product_data:
+        return None
+
+    return {
+        "product_title": product_data['product']['title'],
+        "variant_title": variant_title,
+        "product_handle": product_data['product']['handle'],
+        "store_url": STOREFRONT_BASE_URL
+    }
+
+# --- Email Helper (Unchanged) ---
+def send_email(to_email, subject, text_body, html_body=None):
     if not all([SMTP_SERVER, EMAIL_ADDRESS, EMAIL_PASSWORD]):
         print("❌ Email configuration missing.")
         return False
-        
-    msg = MIMEText(body)
+    print(f"Attempting to send email from {EMAIL_ADDRESS} to {to_email}...")
+    msg = MIMEMultipart('alternative')
     msg['Subject'] = subject
     msg['From'] = EMAIL_ADDRESS
     msg['To'] = to_email
-
+    msg.attach(MIMEText(text_body, 'plain'))
+    if html_body:
+        msg.attach(MIMEText(html_body, 'html'))
     try:
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
             server.starttls()
@@ -188,23 +261,19 @@ def send_email(to_email, subject, body):
             print(f"📧 Email sent successfully to {to_email}")
             return True
     except Exception as e:
-        print(f"❌ Email sending failed to {to_email}: **Check Gmail App Password** or SMTP settings.")
-        print(f"   -> Details: {e}")
+        print(f"❌ Email sending failed: {e}")
         return False
 
-# --- Endpoints (No Change) ---
+# --- API Endpoints ---
 
 @app.route('/', methods=['GET'])
 def home():
-    """Simple check for Render health check."""
-    return "Shopify Waitlist Service is running.", 200
+    return "Shopify Waitlist Service (Webhook-Based) is running.", 200
 
 @app.route('/check-subscription', methods=['GET'])
 def check_subscription():
-    """Checks subscription status for a logged-in user."""
     email = request.args.get('email')
     variant_id = request.args.get('variant_id')
-
     if not email or not variant_id:
         return jsonify({"error": "Missing email or variant ID."}), 400
 
@@ -213,116 +282,185 @@ def check_subscription():
     else:
         return jsonify({"subscribed": False}), 200
 
-
+# --- !!! UPDATED ENDPOINT !!! ---
 @app.route('/notify-signup', methods=['POST'])
 def notify_signup():
-    """Handles the user sign-up request from the Shopify Liquid template."""
     try:
-        if request.content_type != 'application/json':
-             return jsonify({"error": "Content-Type must be application/json."}), 415
-
         data = request.get_json()
+        if not data:
+             return jsonify({"error": "Invalid JSON payload."}), 400
+
         email = data.get('email')
         variant_id = data.get('variant_id')
 
         if not email or not variant_id:
             return jsonify({"error": "Missing email or product variant ID."}), 400
+        
+        numeric_id = _get_numeric_variant_id(variant_id)
+        if not numeric_id:
+            return jsonify({"error": "Invalid variant ID format."}), 400
 
-        # Check if already subscribed to prevent redundant processing/emails
-        if is_subscribed(email, variant_id):
-            return jsonify({"message": "You are already subscribed to the waitlist for this product."}), 200
+        if is_subscribed(email, numeric_id):
+            return jsonify({"message": "You are already subscribed to this waitlist."}), 200
+        
+        # --- NEW STEP: Get inventory_item_id ---
+        variant_data = get_variant_details_for_signup(numeric_id)
+        if not variant_data:
+            print(f"Failed to get inventory_item_id for variant {numeric_id}")
+            return jsonify({"error": "Could not find variant details."}), 404
+        
+        inventory_item_id = variant_data.get('inventory_item_id')
+        # ----------------------------------------
 
-        # Add user to the MongoDB waitlist
-        if add_waitlist_entry(email, variant_id):
-            # Send initial confirmation email
+        if add_waitlist_entry(email, numeric_id, inventory_item_id):
             initial_subject = "✅ You're on the Waitlist!"
-            initial_body = (
-                f"Thanks! We've added your email, {email}, to the notification list for product variant {variant_id}. "
+            text_body = (
+                f"Thanks! We've added your email, {email}, to the notification list for product variant {numeric_id}. "
                 "We will send you a second email the moment the item is back in stock."
             )
-            send_email(email, initial_subject, initial_body)
+            html_body = None
 
-            return jsonify({"message": "Successfully added to the waitlist. Confirmation email sent."}), 200
-        else:
-             return jsonify({"error": "Failed to save entry to database."}), 500
-        
-    except Exception as e:
-        print(f"Error processing sign-up request: {e}")
-        return jsonify({"error": "Internal server error during processing."}), 500
-
-
-# --- Background Stock Checker (Set to 5 minutes for stability) ---
-def stock_checker_task():
-    """Background task to periodically check stock and send notifications."""
-    print("Stock checker thread started.")
-    
-    time.sleep(5) 
-    
-    # 5 minutes (300 seconds) is the recommended minimum for Shopify API stability.
-    # Change to 5 if you insist on 5 seconds, but expect rate limiting.
-    CHECK_INTERVAL_SECONDS = 300 
-    
-    while True:
-        start_time = time.time()
-        print(f"--- Starting stock check cycle at {time.ctime(start_time)} ---")
-        
-        waitlist_map = get_waitlist_entries()
-        print(f"Checking waitlist for {len(waitlist_map)} unique variants.")
-        
-        notified_list = []
-
-        for variant_id, emails in waitlist_map.items():
-            
-            # Check the Shopify API
-            if check_shopify_stock(variant_id):
-                print(f"Variant {variant_id} is IN STOCK. Notifying {len(emails)} customers.")
-                
-                notification_subject = "🎉 IN STOCK NOW! Buy Before It Sells Out!"
-                
-                for email in emails:
-                    notification_body = (
-                        f"Great news, {email}! The product you were waiting for "
-                        f"is officially back in stock! Variant ID: {variant_id}.\n\n"
-                        "Don't wait, buy it here: "
-                        f"{STOREFRONT_BASE_URL}/cart/{variant_id}:1" 
-                        "\n\nNote: This link adds one item directly to your cart."
+            if CONFIRMATION_TEMPLATE:
+                try:
+                    html_body = CONFIRMATION_TEMPLATE.render(
+                        email_address=email,
+                        variant_id=numeric_id,
+                        store_url=STOREFRONT_BASE_URL
                     )
-                    
-                    if send_email(email, notification_subject, notification_body):
-                        notified_list.append((email, variant_id))
-                    else:
-                        print(f"⚠️ WARNING: Failed to send notification email to {email} for variant {variant_id}. (Check SMTP logs above)")
+                except Exception as e:
+                    print(f"Warning: Failed to render confirmation template: {e}")
 
+            email_sent = send_email(email, initial_subject, text_body, html_body)
 
-        # Safely remove notified customers from the database
-        for email, variant_id in notified_list:
-            if remove_waitlist_entry(email, variant_id):
-                 print(f"🗑️ Successfully removed {email} for variant {variant_id} from the waitlist.")
+            if email_sent:
+                return jsonify({"message": "Successfully added to waitlist. Confirmation email sent."}), 200
             else:
-                 print(f"⚠️ WARNING: Failed to remove {email} for variant {variant_id} from the waitlist.")
-        
-        end_time = time.time()
-        duration = end_time - start_time
-        print(f"--- Stock check cycle complete. {len(notified_list)} notifications sent. Duration: {duration:.2f}s ---")
-        
-        # Calculate remaining sleep time to maintain the interval
-        sleep_duration = CHECK_INTERVAL_SECONDS - duration
-        if sleep_duration > 0:
-            print(f"😴 Sleeping for {sleep_duration:.0f} seconds.")
-            time.sleep(sleep_duration)
+                return jsonify({
+                    "message": "Successfully added to waitlist.",
+                    "warning": "Failed to send confirmation email due to server config issue."
+                }), 200
         else:
-            print(f"⚠️ WARNING: Stock check took longer than {CHECK_INTERVAL_SECONDS} seconds. Running next cycle immediately.")
-            time.sleep(5) 
+            return jsonify({"error": "Failed to save entry to database."}), 500
+
+    except Exception as e:
+        print(f"Error in /notify-signup: {e}")
+        return jsonify({"error": "Internal server error."}), 500
 
 
-# --- Run Application (No Change) ---
-if __name__ == '__main__':
-    if waitlist_collection is not None:
-        if not any(t.name == 'StockCheckerThread' for t in threading.enumerate()):
-            stock_thread = threading.Thread(target=stock_checker_task, name='StockCheckerThread')
-            stock_thread.daemon = True 
-            stock_thread.start()
-    else:
-        print("WARNING: Stock checker not started due to MongoDB connection failure.")
+# --- !!! NEW WEBHOOK RECEIVER !!! ---
+@app.route('/shopify-webhook-receiver', methods=['POST'])
+@verify_shopify_webhook
+def shopify_webhook_receiver():
+    """
+    This endpoint receives the 'inventory_levels/update' webhook from Shopify.
+    It verifies the request and then processes the notification.
+    """
+    try:
+        # request.webhook_data was added by the @verify_shopify_webhook decorator
+        payload = json.loads(request.webhook_data.decode('utf-8'))
+        
+        # 1. Check if the product is back in stock
+        available_quantity = payload.get('available', 0)
+        if available_quantity > 0:
+            inventory_item_id = payload.get('inventory_item_id')
+            print(f"Webhook Received: Inventory item {inventory_item_id} is IN STOCK ({available_quantity}).")
+            
+            # 2. Start a new thread to handle notifications
+            # This lets us send the "200 OK" response back to Shopify immediately.
+            notification_thread = threading.Thread(
+                target=process_notifications_for_item, 
+                args=(str(inventory_item_id),)
+            )
+            notification_thread.start()
+        
+        else:
+            # Stock was updated, but still 0 or less.
+            inventory_item_id = payload.get('inventory_item_id')
+            print(f"Webhook Received: Stock update for {inventory_item_id}, but still out of stock ({available_quantity}). No action needed.")
+
+    except Exception as e:
+        print(f"❌ Error processing webhook payload: {e}")
+        # Still return 200 so Shopify stops retrying
+        
+    # IMPORTANT: Always return a 200 OK to Shopify immediately.
+    return jsonify({"status": "received"}), 200
+
+
+# --- !!! NEW NOTIFICATION PROCESSOR !!! ---
+def process_notifications_for_item(inventory_item_id):
+    """
+    (Runs in a background thread)
+    Fetches all users for an item, sends emails, and removes them from the waitlist.
+    """
+    print(f"Thread started: Processing notifications for inventory item {inventory_item_id}")
     
-    app.run(host='00.0.0', port=os.environ.get('PORT', 8080))
+    # 1. Get all users waiting for this item
+    waitlist_entries = get_waitlist_entries_by_inventory_id(inventory_item_id)
+    if not waitlist_entries:
+        print(f"No users found on waitlist for item {inventory_item_id}.")
+        return
+
+    print(f"Found {len(waitlist_entries)} users for item {inventory_item_id}. Fetching product details...")
+    
+    # 2. Get product details (only needs to be done once)
+    # We can get the variant_id from the first entry, as they all share it
+    # (or rather, they all map to the same item)
+    variant_id = waitlist_entries[0]['variant_id']
+    details = get_product_details_for_notification(variant_id)
+    
+    if not details:
+        print(f"⚠️ WARNING: Failed to fetch product details for variant {variant_id}. Cannot send notifications.")
+        return
+
+    notification_subject = "🎉 IN STOCK NOW! Your Item is Back!"
+    notified_list = []
+
+    # 3. Loop through and send emails
+    for entry in waitlist_entries:
+        email = entry['email']
+        
+        text_body = (
+            f"Great news, {email}!\n\n"
+            f"The product you were waiting for is officially back in stock:\n"
+            f"Product: {details['product_title']}\n"
+            f"Variant: {details['variant_title']}\n\n"
+            f"Buy it here before it sells out again:\n"
+            f"{details['store_url']}/products/{details['product_handle']}"
+        )
+        
+        html_body = None
+        if ALERT_TEMPLATE:
+            try:
+                html_body = ALERT_TEMPLATE.render(
+                    product_title=details['product_title'],
+                    variant_title=details['variant_title'],
+                    product_handle=details['product_handle'],
+                    store_url=details['store_url']
+                )
+            except Exception as e:
+                 print(f"Warning: Failed to render alert template for {email}: {e}")
+        
+        if send_email(email, notification_subject, text_body, html_body):
+            notified_list.append(entry)
+        else:
+            print(f"⚠️ WARNING: Failed to send notification to {email} for variant {variant_id}. They remain on the list.")
+
+    # 4. Safely remove notified customers
+    for entry in notified_list:
+        if remove_waitlist_entry(entry['email'], entry['variant_id']):
+            print(f"🗑️ Successfully removed {entry['email']} for variant {entry['variant_id']} from waitlist.")
+        else:
+            print(f"⚠️ WARNING: Failed to remove {entry['email']} from waitlist.")
+    
+    print(f"Thread finished: Notifications complete for inventory item {inventory_item_id}")
+
+
+# --- Run Application ---
+if __name__ == '__main__':
+    if waitlist_collection is None:
+        print("❌ FATAL: MongoDB not connected. Application cannot start correctly.")
+    else:
+        port = int(os.environ.get("PORT", 8080))
+        print(f"Starting Flask server on host 0.0.0.0, port {port}")
+        # Note: We no longer start the stock_checker_task thread!
+        app.run(host='0.0.0.0', port=port)
