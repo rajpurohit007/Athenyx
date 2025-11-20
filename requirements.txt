@@ -5,3 +5,4 @@ flask-cors
 pymongo
 flask_mail
 jinja2
+pywebpush
