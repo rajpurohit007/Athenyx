@@ -11,30 +11,38 @@ from pymongo import MongoClient
 from pymongo.errors import PyMongoError, ServerSelectionTimeoutError 
 from socket import timeout as TimeoutError 
 import re 
+from pywebpush import webpush, WebPushException # 🔔 NEW IMPORT
 
-# --- Configuration: Reads from Environment Variables (No Hardcoded API Key Default) ---
+# --- Configuration: Reads from Environment Variables ---
 try:
-    # IMPORTANT: The Shopify API Key should be set securely in Render environment variables.
     SHOPIFY_STORE_URL = os.environ.get("SHOPIFY_STORE_URL", "raj-dynamic-dreamz.myshopify.com") 
-    
-    # !!! WARNING: Removed the hardcoded key here. Ensure this is set in Render ENV vars!
-    SHOPIFY_API_KEY = os.environ.get("5d9f422c303e02187b2442b1b68edf6a") 
+    SHOPIFY_API_KEY = os.environ.get("SHOPIFY_API_KEY") # Ensure this is set in your Render ENV vars!
     
     SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
     SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
     EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS", "rajpurohit74747@gmail.com")
-    EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "vvhj rkau nncu ugdj") # App Password
+    EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "vvhj rkau nncu ugdj") # Gmail App Password
     SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2023-10") 
     
+    # MongoDB Configuration 
+    MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb+srv://rajpurohit74747:raj123@padhaion.qxq1zfs.mongodb.net/?appName=PadhaiOn")
+    
+    # 🔔 VAPID Keys for Push Notifications
+    VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "")
+    VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
+    VAPID_CLAIM_EMAIL = os.environ.get("VAPID_CLAIM_EMAIL", "mailto:your_contact_email@example.com")
+
     # Safely construct base URL for storefront links
     storefront_base_url_env = os.environ.get("STOREFRONT_BASE_URL")
     if storefront_base_url_env:
         STOREFRONT_BASE_URL = storefront_base_url_env.rstrip('/')
     else:
         STOREFRONT_BASE_URL = f"https://{SHOPIFY_STORE_URL}".rstrip('/')
-    
-    # MongoDB Configuration 
-    MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb+srv://rajpurohit74747:raj123@padhaion.qxq1zfs.mongodb.net/?appName=PadhaiOn")
+
+    if not SHOPIFY_API_KEY:
+        print("❌ WARNING: SHOPIFY_API_KEY is missing. Stock checker will fail.")
+    if not VAPID_PUBLIC_KEY:
+        print("❌ WARNING: VAPID keys are missing. Push notifications disabled.")
 
 except Exception as e:
     print(f"FATAL ERROR: Failed to load environment variables. {e}")
@@ -42,25 +50,27 @@ except Exception as e:
 
 app = Flask(__name__)
 
-# Initialize MongoDB Client (No Change)
+# Initialize MongoDB Client
 waitlist_collection = None
 try:
     client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
     client.admin.command('ping')
     db = client['shopify_waitlist_db'] 
     waitlist_collection = db['waitlist_entries']
+    
+    # Ensure push_subscription is part of the schema/index optimization
     waitlist_collection.create_index([("email", 1), ("variant_id", 1)], unique=True)
+    waitlist_collection.create_index([("variant_id", 1)])
+    
     print("Successfully connected to MongoDB and initialized database.")
 except (ServerSelectionTimeoutError, PyMongoError, TimeoutError) as e:
-    print(f"ERROR: Could not connect to MongoDB. Please check MONGODB_URI/password/DB name. Error: {e}")
+    print(f"ERROR: Could not connect to MongoDB. Error: {e}")
 
-# Configure CORS (No Change)
-if STOREFRONT_BASE_URL:
-    CORS(app, resources={r"/*": {"origins": STOREFRONT_BASE_URL}})
-else:
-    CORS(app) 
+# Configure CORS
+# NOTE: Using environment variable for security, defaults to allow any if not set.
+CORS(app, resources={r"/*": {"origins": os.environ.get("FRONTEND_ORIGIN", "*")}}) 
 
-# --- Database Helpers (No Change) ---
+# --- Database Helpers (UPDATED for Push Subscription) ---
 
 def is_subscribed(email, variant_id):
     """Checks if a customer is already subscribed for a specific variant."""
@@ -72,15 +82,22 @@ def is_subscribed(email, variant_id):
         return False
 
 
-def add_waitlist_entry(email, variant_id):
-    """Adds or updates a waitlist entry, ensuring uniqueness."""
+def add_waitlist_entry(email, variant_id, push_subscription=None):
+    """Adds or updates a waitlist entry, including push subscription."""
     if waitlist_collection is None: 
         print("DB Not Connected.")
         return False
+    
     try:
+        update_fields = {'timestamp': time.time()}
+        
+        # 🔔 CRITICAL FIX: Add/Update the push subscription object
+        if push_subscription and isinstance(push_subscription, dict) and 'endpoint' in push_subscription:
+            update_fields['push_subscription'] = push_subscription
+        
         waitlist_collection.update_one(
             {'email': email, 'variant_id': str(variant_id)},
-            {'$set': {'timestamp': time.time()}},
+            {'$set': update_fields},
             upsert=True
         )
         return True
@@ -89,25 +106,16 @@ def add_waitlist_entry(email, variant_id):
         return False
 
 def get_waitlist_entries():
-    """Retrieves all unique variant IDs and the emails waiting for them."""
+    """Retrieves all unique variants and the entries waiting for them."""
     if waitlist_collection is None: 
-        return {}
+        return []
     
     try:
-        pipeline = [
-            {
-                '$group': {
-                    '_id': '$variant_id',
-                    'emails': {'$addToSet': '$email'}
-                }
-            }
-        ]
-        results = list(waitlist_collection.aggregate(pipeline))
-        waitlist_map = {item['_id']: item['emails'] for item in results}
-        return waitlist_map
+        # Retrieve all entries with push subscriptions included
+        return list(waitlist_collection.find())
     except PyMongoError as e:
         print(f"DB Error fetching waitlist: {e}")
-        return {}
+        return []
 
 
 def remove_waitlist_entry(email, variant_id):
@@ -120,15 +128,14 @@ def remove_waitlist_entry(email, variant_id):
         print(f"DB Error removing entry: {e}")
         return False
 
-# --- Shopify API Helper (Improved Error Logging) ---
+# --- Shopify API Helper (Unchanged) ---
 def check_shopify_stock(variant_id):
     """Fetches the inventory quantity for a specific product variant."""
+    # (function body remains the same as provided in your input)
     if not SHOPIFY_STORE_URL or not SHOPIFY_API_KEY: 
         print("❌ ERROR: Shopify credentials missing. Cannot check stock.")
-        # If credentials are missing, we cannot proceed.
         return False
     
-    # Robustly extract numeric ID (No Change)
     variant_id_str = str(variant_id)
     match = re.search(r'\d+$', variant_id_str)
     numeric_id = match.group(0) if match else variant_id_str
@@ -152,7 +159,7 @@ def check_shopify_stock(variant_id):
              print(f"❌ Shopify API Error 404: Variant {numeric_id} not found. Check the ID.")
              return False
         
-        response.raise_for_status() # Raises HTTPError for 4xx/5xx status codes
+        response.raise_for_status() 
         
         data = response.json()
         inventory_quantity = data['variant']['inventory_quantity']
@@ -168,9 +175,10 @@ def check_shopify_stock(variant_id):
         print(f"❌ Shopify API Request Error checking variant {variant_id}. Error: {e}")
         return False
 
-# --- Email Helper (No Change) ---
+
+# --- Email Helper (Unchanged) ---
 def send_email(to_email, subject, body):
-    """Sends an email using the configured SMTP settings."""
+    # (function body remains the same as provided in your input)
     if not all([SMTP_SERVER, EMAIL_ADDRESS, EMAIL_PASSWORD]):
         print("❌ Email configuration missing.")
         return False
@@ -192,7 +200,127 @@ def send_email(to_email, subject, body):
         print(f"   -> Details: {e}")
         return False
 
-# --- Endpoints (No Change) ---
+# --- 🔔 NEW Push Notification Helper ---
+def send_push_notification(subscription, payload):
+    """Sends a push notification to a subscribed browser endpoint."""
+    if not all([VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY]):
+        # This should have been caught in config warning, but safe to check here
+        return False
+        
+    try:
+        # Pywebpush expects the subscription object directly
+        webpush(
+            subscription_info=subscription,
+            data=json.dumps(payload),
+            vapid_private_key=VAPID_PRIVATE_KEY,
+            vapid_claims={"sub": VAPID_CLAIM_EMAIL}
+        )
+        print(f"🔔 Push notification sent successfully.")
+        return True
+    except WebPushException as e:
+        print(f"❌ Push notification failed (Status {e.response.status_code}): {e.response.text}")
+        if e.response.status_code == 410: # Gone/Expired
+            print("   -> Subscription is expired (410). Needs to be removed from DB.")
+        return False
+    except Exception as e:
+        print(f"❌ Push notification failed: {e}")
+        return False
+
+
+# --- Background Stock Checker (UPDATED for Push) ---
+def stock_checker_task():
+    """Background task to periodically check stock and send notifications."""
+    print("Stock checker thread started.")
+    
+    CHECK_INTERVAL_SECONDS = 300 # 5 minutes
+    time.sleep(5) 
+    
+    while True:
+        start_time = time.time()
+        print(f"--- Starting stock check cycle at {time.ctime(start_time)} ---")
+        
+        # Changed to fetch all entries, not just unique variants (needed for push subscriptions)
+        all_entries = get_waitlist_entries()
+        print(f"Checking waitlist for {len(all_entries)} entries.")
+        
+        notified_list = []
+        variants_to_check = {} # Group entries by variant_id for API calls
+
+        for entry in all_entries:
+            variant_id = entry.get('variant_id')
+            if variant_id not in variants_to_check:
+                variants_to_check[variant_id] = []
+            variants_to_check[variant_id].append(entry)
+
+
+        for variant_id, entries in variants_to_check.items():
+            
+            # Check the Shopify API
+            if check_shopify_stock(variant_id):
+                
+                # --- Notification Content ---
+                notification_subject = "🎉 IN STOCK NOW! Buy Before It Sells Out!"
+                notification_url = f"{STOREFRONT_BASE_URL}/cart/{variant_id}:1"
+                
+                for entry in entries:
+                    email = entry.get('email')
+                    push_subscription = entry.get('push_subscription')
+                    
+                    email_body = (
+                        f"Great news, {email}! The product you were waiting for "
+                        f"is officially back in stock! Variant ID: {variant_id}.\n\n"
+                        f"Don't wait, buy it here: {notification_url}" 
+                        "\n\nNote: This link adds one item directly to your cart."
+                    )
+                    
+                    push_payload = {
+                        "title": "🔥 Back in Stock!",
+                        "body": f"Your variant ({variant_id}) is available now!",
+                        "url": notification_url
+                    }
+                    
+                    email_ok = False
+                    push_ok = False
+                    
+                    # 1. Send Email
+                    if send_email(email, notification_subject, email_body):
+                        email_ok = True
+                    
+                    # 2. Send Push Notification
+                    if push_subscription:
+                        if send_push_notification(push_subscription, push_payload):
+                            push_ok = True
+                        
+                    # If either succeeded, mark for removal
+                    if email_ok or push_ok:
+                        notified_list.append((email, variant_id))
+                        print(f"   -> Notified {email} (Email: {email_ok}, Push: {push_ok})")
+                    else:
+                        print(f"   -> WARNING: Failed all notifications for {email}.")
+
+
+        # Safely remove notified customers from the database
+        for email, variant_id in set(notified_list): # Use set to ensure unique removal actions
+            if remove_waitlist_entry(email, variant_id):
+                 print(f"🗑️ Successfully removed {email} for variant {variant_id} from the waitlist.")
+            else:
+                 print(f"⚠️ WARNING: Failed to remove {email} for variant {variant_id} from the waitlist.")
+        
+        end_time = time.time()
+        duration = end_time - start_time
+        print(f"--- Stock check cycle complete. {len(notified_list)} notification attempts made. Duration: {duration:.2f}s ---")
+        
+        # Calculate remaining sleep time
+        sleep_duration = CHECK_INTERVAL_SECONDS - duration
+        if sleep_duration > 0:
+            print(f"😴 Sleeping for {sleep_duration:.0f} seconds.")
+            time.sleep(sleep_duration)
+        else:
+            print(f"⚠️ WARNING: Stock check took longer than {CHECK_INTERVAL_SECONDS} seconds. Running next cycle immediately.")
+            time.sleep(5) 
+
+
+# --- Endpoints (FIXED VAPID KEY ROUTE) ---
 
 @app.route('/', methods=['GET'])
 def home():
@@ -213,6 +341,15 @@ def check_subscription():
     else:
         return jsonify({"subscribed": False}), 200
 
+# 🔔 NEW ENDPOINT: Serves VAPID Public Key (Fixes 404 Error)
+@app.route('/vapid-public-key', methods=['GET'])
+def vapid_public_key():
+    """Returns the VAPID Public Key for the frontend Service Worker."""
+    if not VAPID_PUBLIC_KEY:
+        return jsonify({"error": "VAPID Public Key not configured on the server."}), 503
+    
+    return jsonify({"publicKey": VAPID_PUBLIC_KEY}), 200
+
 
 @app.route('/notify-signup', methods=['POST'])
 def notify_signup():
@@ -224,25 +361,29 @@ def notify_signup():
         data = request.get_json()
         email = data.get('email')
         variant_id = data.get('variant_id')
+        push_subscription = data.get('push_subscription') # 🔔 Retrieve push subscription
 
         if not email or not variant_id:
             return jsonify({"error": "Missing email or product variant ID."}), 400
 
         # Check if already subscribed to prevent redundant processing/emails
-        if is_subscribed(email, variant_id):
-            return jsonify({"message": "You are already subscribed to the waitlist for this product."}), 200
-
-        # Add user to the MongoDB waitlist
-        if add_waitlist_entry(email, variant_id):
-            # Send initial confirmation email
-            initial_subject = "✅ You're on the Waitlist!"
-            initial_body = (
-                f"Thanks! We've added your email, {email}, to the notification list for product variant {variant_id}. "
-                "We will send you a second email the moment the item is back in stock."
-            )
-            send_email(email, initial_subject, initial_body)
-
-            return jsonify({"message": "Successfully added to the waitlist. Confirmation email sent."}), 200
+        is_already_subscribed = is_subscribed(email, variant_id)
+        
+        # Add or update user to the MongoDB waitlist, including push subscription
+        if add_waitlist_entry(email, variant_id, push_subscription):
+            
+            if not is_already_subscribed:
+                # Send initial confirmation email only for new subscriptions
+                initial_subject = "✅ You're on the Waitlist!"
+                initial_body = (
+                    f"Thanks! We've added your email, {email}, to the notification list for variant {variant_id}. "
+                    "We will send you a second email the moment the item is back in stock."
+                )
+                send_email(email, initial_subject, initial_body)
+                return jsonify({"message": "Successfully added to the waitlist. Confirmation email sent."}), 200
+            else:
+                 # Success message for updates
+                 return jsonify({"message": "Subscription updated."}), 200
         else:
              return jsonify({"error": "Failed to save entry to database."}), 500
         
@@ -251,71 +392,7 @@ def notify_signup():
         return jsonify({"error": "Internal server error during processing."}), 500
 
 
-# --- Background Stock Checker (Set to 5 minutes for stability) ---
-def stock_checker_task():
-    """Background task to periodically check stock and send notifications."""
-    print("Stock checker thread started.")
-    
-    time.sleep(5) 
-    
-    # 5 minutes (300 seconds) is the recommended minimum for Shopify API stability.
-    # Change to 5 if you insist on 5 seconds, but expect rate limiting.
-    CHECK_INTERVAL_SECONDS = 300 
-    
-    while True:
-        start_time = time.time()
-        print(f"--- Starting stock check cycle at {time.ctime(start_time)} ---")
-        
-        waitlist_map = get_waitlist_entries()
-        print(f"Checking waitlist for {len(waitlist_map)} unique variants.")
-        
-        notified_list = []
-
-        for variant_id, emails in waitlist_map.items():
-            
-            # Check the Shopify API
-            if check_shopify_stock(variant_id):
-                print(f"Variant {variant_id} is IN STOCK. Notifying {len(emails)} customers.")
-                
-                notification_subject = "🎉 IN STOCK NOW! Buy Before It Sells Out!"
-                
-                for email in emails:
-                    notification_body = (
-                        f"Great news, {email}! The product you were waiting for "
-                        f"is officially back in stock! Variant ID: {variant_id}.\n\n"
-                        "Don't wait, buy it here: "
-                        f"{STOREFRONT_BASE_URL}/cart/{variant_id}:1" 
-                        "\n\nNote: This link adds one item directly to your cart."
-                    )
-                    
-                    if send_email(email, notification_subject, notification_body):
-                        notified_list.append((email, variant_id))
-                    else:
-                        print(f"⚠️ WARNING: Failed to send notification email to {email} for variant {variant_id}. (Check SMTP logs above)")
-
-
-        # Safely remove notified customers from the database
-        for email, variant_id in notified_list:
-            if remove_waitlist_entry(email, variant_id):
-                 print(f"🗑️ Successfully removed {email} for variant {variant_id} from the waitlist.")
-            else:
-                 print(f"⚠️ WARNING: Failed to remove {email} for variant {variant_id} from the waitlist.")
-        
-        end_time = time.time()
-        duration = end_time - start_time
-        print(f"--- Stock check cycle complete. {len(notified_list)} notifications sent. Duration: {duration:.2f}s ---")
-        
-        # Calculate remaining sleep time to maintain the interval
-        sleep_duration = CHECK_INTERVAL_SECONDS - duration
-        if sleep_duration > 0:
-            print(f"😴 Sleeping for {sleep_duration:.0f} seconds.")
-            time.sleep(sleep_duration)
-        else:
-            print(f"⚠️ WARNING: Stock check took longer than {CHECK_INTERVAL_SECONDS} seconds. Running next cycle immediately.")
-            time.sleep(5) 
-
-
-# --- Run Application (No Change) ---
+# --- Run Application ---
 if __name__ == '__main__':
     if waitlist_collection is not None:
         if not any(t.name == 'StockCheckerThread' for t in threading.enumerate()):
@@ -325,5 +402,4 @@ if __name__ == '__main__':
     else:
         print("WARNING: Stock checker not started due to MongoDB connection failure.")
     
-    app.run(host='00.0.0', port=os.environ.get('PORT', 8080))
-
+    app.run(host='0.0.0.0', port=os.environ.get('PORT', 10000))
