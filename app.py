@@ -83,27 +83,32 @@ def is_subscribed(email, variant_id):
 
 
 def add_waitlist_entry(email, variant_id, push_subscription=None):
-    """Adds or updates a waitlist entry, including push subscription."""
-    if waitlist_collection is None: 
+    if waitlist_collection is None:
         print("DB Not Connected.")
         return False
-    
+
     try:
-        update_fields = {'timestamp': time.time()}
-        
-        # 🔔 CRITICAL FIX: Add/Update the push subscription object
-        if push_subscription and isinstance(push_subscription, dict) and 'endpoint' in push_subscription:
-            update_fields['push_subscription'] = push_subscription
-        
+        update_fields = {
+            "timestamp": time.time(),
+            "email": email,
+            "variant_id": str(variant_id)
+        }
+
+        # Store push subscription if valid
+        if push_subscription and isinstance(push_subscription, dict) and "endpoint" in push_subscription:
+            update_fields["push_subscription"] = push_subscription
+
         waitlist_collection.update_one(
-            {'email': email, 'variant_id': str(variant_id)},
-            {'$set': update_fields},
+            {"email": email, "variant_id": str(variant_id)},
+            {"$set": update_fields},
             upsert=True
         )
         return True
+
     except PyMongoError as e:
         print(f"DB Error adding entry: {e}")
         return False
+
 
 def get_waitlist_entries():
     """Retrieves all unique variants and the entries waiting for them."""
