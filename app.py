@@ -31,9 +31,9 @@ try:
     )
 
     # 🔔 VAPID Keys for Push Notifications
-    VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "")
-    VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
-    VAPID_CLAIM_EMAIL = os.environ.get("VAPID_CLAIM_EMAIL", "mailto:your_contact_email@example.com")
+    VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "BDwCgw519N3sNXDRO1TvFC-n5FDRK_yKJlmP7oe4Lgqnz5uk9pjHknsxpt4LcTcU7_OGGGWCsHdXdxCUHaVxAFg ")
+    VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "s5dJQSGa2lavMc0swU6qKgQwQBDLNe8d5oGx3czzK80")
+    VAPID_CLAIM_EMAIL = os.environ.get("VAPID_CLAIM_EMAIL", "mailto:rajpurohit7474747@gmail.com")
 
     # Safely construct base URL for storefront links
     storefront_base_url_env = os.environ.get("STOREFRONT_BASE_URL")
