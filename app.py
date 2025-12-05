@@ -87,7 +87,6 @@ def is_subscribed(email, variant_id):
 def add_waitlist_entry(email, variant_id, push_subscription=None):
     """
     Adds or updates a waitlist entry, including push subscription.
-    CRITICAL: explicitly set email + variant_id + timestamp in $set.
     """
     if waitlist_collection is None:
         print("DB Not Connected.")
@@ -105,7 +104,10 @@ def add_waitlist_entry(email, variant_id, push_subscription=None):
             and isinstance(push_subscription, dict)
             and "endpoint" in push_subscription
         ):
+            print("✅ Received push_subscription with endpoint:", push_subscription.get("endpoint"))
             update_fields["push_subscription"] = push_subscription
+        else:
+            print("ℹ️ No valid push_subscription provided; saving email only.")
 
         waitlist_collection.update_one(
             {"email": email, "variant_id": str(variant_id)},
